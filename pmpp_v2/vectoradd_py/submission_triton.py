@@ -36,13 +36,14 @@ def custom_kernel(data: input_t) -> output_t:
     assert A.device == B.device == output.device
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    add_kernel[grid](A, B, output, n_elements, BLOCK_SIZE=1024)
+    add_kernel[grid](A, B, output, n_elements, BLOCK_SIZE=2048, num_warps=8)
     return output
 
-# A100
+# A100 (num_warps=4)
 # BLOCK_SIZE = 512, 947.200μs
 # BLOCK_SIZE = 1024, 896.683μs 
 # BLOCK_SIZE = 2048, 950.955μs
 
 # B200
-# BLOCK_SIZE = 235.139μs
+# BLOCK_SIZE = 1024, num_warps=4, 235.139μs
+# BLOCK_SIZE = 2048, num_warps=8, 235.804μs
