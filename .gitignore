@@ -1,0 +1,6 @@
+**/.codex/
+**/.claude/
+**/.popcorn/
+.venv/
+__pycache__/
+**/AGENTS.md
