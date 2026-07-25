@@ -33,7 +33,7 @@ def softmax_kernel(output_ptr, input_ptr, input_row_stride, output_row_stride, n
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < n_cols # n_cols <= BLOCK_SIZE 라는 가정이 들어 있음.
 
-    for row_idx in range(row_start, n_rows, row_step, num_stages=num_stages):
+    for row_idx in tl.range(row_start, n_rows, row_step, num_stages=num_stages):
         row_start_ptr = input_ptr + row_idx * input_row_stride
         input_ptrs = row_start_ptr + col_offsets # 담당할 입력들
         row = tl.load(input_ptrs, mask=mask, other=-float('inf')) # mask가 False인 자리는 메모리를 건드리지 않고 대신 -inf를 채워 넣음.
