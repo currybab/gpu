@@ -122,7 +122,9 @@ def benchmark(M, N, provider):
 
 benchmark.run(show_plots=True, print_data=True)
 
+# RTX 5090 (이론 최대 1792 GB/s (약 1.79 TB/s))
 # run1 (range, num_stage=2)     Triton 1457.1 / Torch 1502.8
 # run2 (tl.range, num_stage=2)  Triton 1411.0 / Torch 1502.8
 # run3 (tl.range, num_stages=1)  Triton 1457.6 / Torch 1502.2
 # run4 (range, num_stage=1)  Triton 1457.4 / Torch 1502.7
+# tutorial code인 일반 range를 적용할 경우 software pipelining이 동작하지 않음.
