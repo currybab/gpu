@@ -1,5 +1,5 @@
 - [2026-07-25 vector add(triton & cuda)](./pmpp_v2/vectoradd_py/)
-- [2026-07-25 fused softmax(triton & cuda)](./trition-tutorial/fused-softmax/)
+- [2026-08-04 fused softmax(triton & cuda)](./trition_tutorial/fused_softmax/)
 
 ## Modal에서 실행하기
 
