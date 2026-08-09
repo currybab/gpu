@@ -1,7 +1,8 @@
 """Modal 위에서 이 저장소의 커널 스크립트를 실행하는 러너.
 
 사용 예:
-    uv run modal run modal_run.py                                   # 기본: fused_softmax, H100
+    uv run modal run modal_run.py                                   # 기본: fused_softmax, B200
+    uv run modal run modal_run.py --diagnostics                     # 커널 자원 + Torch CUDA profiler
     uv run modal run modal_run.py --gpu B200                        # GPU 변경
     uv run modal run modal_run.py --script pmpp_v2/vectoradd_py/submission_triton.py
 
@@ -16,6 +17,7 @@ import modal
 REPO = pathlib.Path(__file__).parent
 REMOTE_REPO = "/root/repo"
 REMOTE_OUT = "/root/out"
+DIAGNOSTICS_ENV = "GPU_LAB_DIAGNOSTICS"
 
 # nvcc가 들어있는 devel 이미지. torch의 load_inline(CUDA C++ 인라인 컴파일)까지 쓰려면 필요하다.
 # CUDA 13.0.0 = Modal 호스트 CUDA(13.0, driver 580.95.05)와 정확히 일치 + torch 2.13 기본 빌드.
@@ -42,7 +44,7 @@ app = modal.App("gpu-lab", image=image)
 
 
 @app.function(timeout=60 * 30)
-def run_script(rel_path: str) -> dict[str, bytes]:
+def run_script(rel_path: str, diagnostics: bool = False) -> dict[str, bytes]:
     """저장소 안의 스크립트 하나를 __main__ 으로 실행하고, 생성된 산출물을 돌려준다."""
     import runpy
     import subprocess
@@ -56,9 +58,12 @@ def run_script(rel_path: str) -> dict[str, bytes]:
     print(f"Torch: {torch.__version__}")
     print(f"Triton: {triton.__version__}")
     print(f"Torch CUDA: {torch.version.cuda}")
+    print(f"Diagnostics: {'enabled' if diagnostics else 'disabled'}")
 
     script = pathlib.Path(REMOTE_REPO) / rel_path
     os.makedirs(REMOTE_OUT, exist_ok=True)
+    # 원격 컨테이너가 재사용되어도 이전 실행의 값이 남지 않게 매번 명시한다.
+    os.environ[DIAGNOSTICS_ENV] = "1" if diagnostics else "0"
     # 스크립트가 같은 디렉토리의 모듈을 import 할 수 있게(예: task.py) 경로를 맞춘다.
     sys.path.insert(0, str(script.parent))
     os.chdir(REMOTE_OUT)
@@ -76,8 +81,9 @@ def run_script(rel_path: str) -> dict[str, bytes]:
 def main(
     script: str = "trition_tutorial/fused_softmax/fused_softmax.py",
     gpu: str = "B200",
+    diagnostics: bool = False,
 ):
-    artifacts = run_script.with_options(gpu=gpu).remote(script)
+    artifacts = run_script.with_options(gpu=gpu).remote(script, diagnostics)
 
     if artifacts:
         out_dir = REPO / "modal_out" / gpu

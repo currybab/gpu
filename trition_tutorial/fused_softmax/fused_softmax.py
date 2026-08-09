@@ -1,9 +1,12 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
 from triton.runtime import driver
 
 DEVICE = driver.active.get_active_torch_device()
+DIAGNOSTICS = os.environ.get("GPU_LAB_DIAGNOSTICS") == "1"
 
 
 def naive_softmax(x: torch.Tensor) -> torch.Tensor:
@@ -57,6 +60,7 @@ SIZE_SMEM = properties["max_shared_mem"]
 WARP_SIZE = properties["warpSize"]
 target = triton.runtime.driver.active.get_current_target()
 kernels = {}
+reported_kernel_configs = set()
 
 
 def softmax(x):
@@ -78,10 +82,33 @@ def softmax(x):
                                    # x,y도 데이터를 읽는 게 아니라, dtype/포인터 타입 정보만 뽑는 용도임.
     kernel._init_handles() # n_regs는 컴파일러가 계산한 값이 아니라 드라이버가 로드된 함수를 보고 알려주는 값이라, 모듈이 올라가 있지 않으면 읽을 수가 없음. _init_handles()가 그 로딩을 강제.
     n_regs = kernel.n_regs # 스레드 1개당 레지스터 수
+    n_spills = kernel.n_spills
     size_smem = kernel.metadata.shared # 프로그램 1개당 shared memory (bytes)
-    
-    occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps) # 레지스터수로 계산한 최대 프로그램 수
-    occupancy = min(occupancy, SIZE_SMEM // size_smem) # shared memory로 계산한 최대 프로그램 수를 계산하고 둘 중 최소값을 선택.
+
+    register_occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
+    shared_memory_occupancy = SIZE_SMEM // size_smem if size_smem else None
+    occupancy = register_occupancy
+    if shared_memory_occupancy is not None:
+        occupancy = min(occupancy, shared_memory_occupancy)
+
+    config = (str(x.dtype), BLOCK_SIZE, num_stages, num_warps)
+    if DIAGNOSTICS and config not in reported_kernel_configs:
+        reported_kernel_configs.add(config)
+        print(
+            "[Triton kernel] "
+            f"dtype={x.dtype}, BLOCK_SIZE={BLOCK_SIZE}, "
+            f"num_stages={num_stages}, num_warps={num_warps}"
+        )
+        print(
+            f"  n_regs={n_regs}, n_spills={n_spills}, "
+            f"shared_memory={size_smem} bytes"
+        )
+        print(
+            "  programs/SM: "
+            f"register_limit={register_occupancy}, "
+            f"shared_memory_limit={shared_memory_occupancy or 'unlimited'}, "
+            f"selected={occupancy}"
+        )
     
     num_programs = NUM_SM * occupancy # SM 수와 occupancy를 곱해 전체 프로그램 수 계산
     num_programs = min(num_programs, n_rows) # 프로그램 수를 행 수와 비교해 최소값으로 제한
@@ -91,12 +118,37 @@ def softmax(x):
     return y
 
 
+def profile_torch_softmax(x: torch.Tensor) -> None:
+    """Torch softmax가 실제로 띄우는 CUDA 커널을 한 번 기록한다."""
+    # CUDA context 초기화와 최초 라이브러리 준비 비용은 profile에서 제외한다.
+    for _ in range(5):
+        torch.softmax(x, dim=-1)
+    torch.cuda.synchronize()
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profiler:
+        torch.softmax(x, dim=-1)
+    torch.cuda.synchronize()
+
+    print("[Torch softmax CUDA profiler]")
+    print(
+        profiler.key_averages().table(
+            sort_by="cuda_time_total",
+            row_limit=30,
+        )
+    )
+
+
 torch.manual_seed(0)
 x = torch.randn(1823, 781, device=DEVICE)
 y_triton = softmax(x)
 y_torch = torch.softmax(x, axis=1)
 assert torch.allclose(y_triton, y_torch), (y_triton, y_torch)
 print("Softmax test passed!")
+
+if DIAGNOSTICS:
+    profile_torch_softmax(x)
 
 
 @triton.testing.perf_report(
