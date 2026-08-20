@@ -62,7 +62,7 @@ grid = 전체 tile 수
 program p -> tile p 하나
 
 persistent:
-grid = min(NUM_SMS, 전체 tile 수)
+grid = min(SM 수, 전체 tile 수)
 program p -> tile p, p + grid, p + 2*grid, ...
 ```
 
@@ -71,7 +71,7 @@ kernel 안의 핵심 loop는 다음 모양이다.
 ```python
 start_tile = tl.program_id(0)
 
-for tile_id in tl.range(start_tile, num_tiles, NUM_SMS, flatten=True):
+for tile_id in tl.range(start_tile, num_tiles, NUM_PROGRAMS):
     tile_m, tile_n = linear_tile_to_mn(tile_id)
     # tile마다 acc=0부터 GEMM
     # 결과 저장 후 다음 tile로 이동
@@ -79,11 +79,16 @@ for tile_id in tl.range(start_tile, num_tiles, NUM_SMS, flatten=True):
 
 program이 GPU에 오래 남는다는 의미에서 persistent라고 부른다. launch/scheduling overhead를 줄이고 tile 사이의 pipeline을 발전시킬 여지가 생기지만, GPU의 동적 load balancing을 일부 포기한다. 따라서 항상 일반 GEMM보다 빠른 것은 아니다.
 
-## grouped ordering
+## 첫 뼈대는 왜 row-major인가
 
-linear tile id를 단순 row-major로 풀면 가까운 program들이 A/B tile을 재사용하기 어렵다. `GROUP_SIZE_M`개의 M tile을 한 묶음으로 두고 묶음 안에서 N 방향으로 진행하면 L2 reuse가 좋아질 수 있다.
+첫 구현에서는 linear tile id를 단순한 row-major 좌표로 바꾼다.
 
-`persistent_matmul.py`의 `_linear_tile_to_mn`은 일반 kernel과 persistent kernel이 같은 mapping을 공유하게 한다. 먼저 `GROUP_SIZE_M=1`로 검증하고, 이후 8로 바꿔 성능을 비교한다.
+```python
+tile_m = tile_id // num_n_tiles
+tile_n = tile_id % num_n_tiles
+```
+
+L2 reuse를 개선하는 grouped ordering은 중요한 최적화지만 persistent scheduling의 핵심은 아니다. 기본/persistent 결과가 모두 맞은 뒤 별도 단계로 추가한다. 그래서 초기 `persistent_matmul.py`에는 mapping helper나 `GROUP_SIZE_M`을 미리 넣지 않았다.
 
 ## 1단계: 기본 GEMM 완성
 
@@ -96,11 +101,11 @@ offs_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
 offs_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
 offs_k = tl.arange(0, BLOCK_K)
 
-a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+a_ptrs = A + offs_m[:, None] * K + offs_k[None, :]
+b_ptrs = B + offs_k[:, None] * N + offs_n[None, :]
 ```
 
-K loop에서 A pointer는 `BLOCK_K * stride_ak`, B pointer는 `BLOCK_K * stride_bk`만큼 전진한다. 마지막 K tile은 `start_k + offs_k < K`로 mask하고 0을 채운다.
+K loop에서 A pointer는 `BLOCK_K`, B pointer는 `BLOCK_K * N`만큼 전진한다. 마지막 K tile은 `start_k + offs_k < K`로 mask하고 0을 채운다. stride 지원은 두 kernel이 맞은 뒤 wrapper와 pointer 식을 일반화하는 과제로 남긴다.
 
 ### accumulator와 store
 
@@ -112,12 +117,9 @@ wrapper는 다음 고정값부터 시작한다.
 BLOCK_M = 64
 BLOCK_N = 64
 BLOCK_K = 32
-GROUP_SIZE_M = 1
 num_warps = 4
 num_stages = 2
 ```
-
-정확도가 맞으면 `GROUP_SIZE_M=8`로 바꾼다.
 
 ## 2단계: persistent scheduling
 
@@ -132,19 +134,32 @@ num_programs = min(num_sms, num_tiles)
 grid = (num_programs,)
 ```
 
-kernel meta-parameter `NUM_SMS`에는 실제 grid stride인 `num_programs`를 넘긴다. 이름이 NUM_SMS여도 작은 문제에서는 grid가 SM 수보다 작을 수 있다.
+kernel meta-parameter `NUM_PROGRAMS`에는 실제 grid stride인 `num_programs`를 넘긴다.
 
 ## 검증
 
 ```bash
-uv run modal run modal_run.py +  --script trition_tutorial/persistent_matmul/check.py +  --gpu B200
+uv run modal run modal_run.py \
+  --script trition_tutorial/persistent_matmul/check.py \
+  --gpu B200
 ```
 
 `check.py`는 기본/persistent 구현을 각각 `torch.matmul`과 비교한다. 아직 구현하지 않은 함수는 `pending`으로 출력하므로 기본 GEMM부터 한 단계씩 진행할 수 있다.
 
 검증 shape에는 tile 배수와 비배수가 모두 있다. 처음에는 첫 shape만 남겨 pointer를 확인하고, 그다음 tail case를 복구한다.
 
-## 3단계: 성능 실험
+## 3단계: grouped ordering
+
+두 kernel의 row-major 버전이 맞은 뒤 linear tile mapping만 grouped ordering으로 교체한다. `GROUP_SIZE_M`개의 M tile을 한 묶음으로 두고 묶음 안에서 N 방향으로 진행하면 가까운 program이 A/B tile을 L2에서 재사용할 가능성이 커진다.
+
+일반/persistent kernel이 같은 mapping helper를 사용하게 만들고 다음을 비교한다.
+
+- `GROUP_SIZE_M=1`: 사실상 단순 ordering
+- `GROUP_SIZE_M=8`: 첫 최적화 후보
+
+mapping을 바꿔도 각 C tile을 정확히 한 번씩 방문하는지 작은 tile 좌표를 출력하거나 별도 Python 함수로 먼저 확인한다.
+
+## 4단계: 성능 실험
 
 정확도 통과 후 `triton.testing.do_bench`로 다음을 같은 shape에서 비교한다.
 
@@ -166,7 +181,7 @@ TFLOPS = 2 * M * N * K / (milliseconds * 1e9)
 
 변수는 한 번에 하나만 바꾼다.
 
-1. `NUM_SMS`: 실제 SM의 1/2, 1배
+1. `NUM_PROGRAMS`: 실제 SM의 1/2, 1배
 2. `BLOCK_M/BLOCK_N/BLOCK_K`
 3. `GROUP_SIZE_M`
 4. `num_warps`, `num_stages`
@@ -189,7 +204,7 @@ TMA나 warp specialization이 persistent의 정의는 아니다. 핵심은 고�
 
 - persistent loop 밖에서 `acc`를 초기화해 서로 다른 C tile 값이 섞임
 - 다음 tile에서도 이전 A/B pointer를 계속 사용함
-- grid stride와 kernel의 `NUM_SMS`가 다름
+- grid stride와 kernel의 `NUM_PROGRAMS`가 다름
 - K tail load에는 mask했지만 C의 M/N tail store에는 mask하지 않음
 - `num_tiles < num_sms`인데 불필요한 program까지 launch함
 - performance 비교 전에 correctness와 warmup을 확인하지 않음

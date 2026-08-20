@@ -65,9 +65,8 @@ Python의 tensor list 자체를 Triton kernel에 넘길 수 없다. wrapper가 �
 | `group_b_ptrs` | `[G]` | 각 B의 address |
 | `group_c_ptrs` | `[G]` | 각 C의 address |
 | `group_sizes` | `[G, 3]` | 각 `(M, N, K)` |
-| `group_strides` | `[G, 3]` | 각 `(lda, ldb, ldc)` |
 
-`group_gemm.py`의 `_prepare_metadata`는 이 부분이 이미 작성돼 있다. pointer tensor가 살아 있는 동안 원래 A/B/C tensor도 반드시 살아 있어야 한다. pointer 숫자만 남는다고 tensor 수명이 자동 보장되는 것은 아니다.
+첫 뼈대는 모든 tensor를 contiguous로 제한하므로 stride metadata를 따로 만들지 않는다. A의 row stride는 `K`, B와 C의 row stride는 `N`에서 바로 얻는다. pointer tensor가 살아 있는 동안 원래 A/B/C tensor도 반드시 살아 있어야 한다. pointer 숫자만 남는다고 tensor 수명이 자동 보장되는 것은 아니다.
 
 kernel에서는 주소를 다시 typed pointer로 복원한다.
 
@@ -108,11 +107,10 @@ tile_n = tile_in_problem % num_n_tiles
 
 `_group_gemm_kernel`의 TODO를 다음 순서로 채운다.
 
-1. 현재 problem의 `lda/ldb/ldc` load
-2. A/B/C raw address load와 FP16 pointer cast
-3. `tile_m/tile_n`에서 A/B pointer 계산
-4. K loop와 FP32 `tl.dot`
-5. C store
+1. A/B/C raw address load와 FP16 pointer cast
+2. 현재 `M/N/K`와 `tile_m/tile_n`에서 pointer 계산
+3. K loop와 FP32 `tl.dot`
+4. C store
 
 시작 config:
 
@@ -188,7 +186,9 @@ uv run modal run modal_run.py \
 ## 검증
 
 ```bash
-uv run modal run modal_run.py +  --script trition_tutorial/group_gemm/check.py +  --gpu B200
+uv run modal run modal_run.py \
+  --script trition_tutorial/group_gemm/check.py \
+  --gpu B200
 ```
 
 현재 wrapper는 의도적으로 `NotImplementedError`를 낸다. kernel TODO와 launch를 완성하면 네 개의 서로 다른 GEMM 결과가 출력된다.
@@ -197,10 +197,11 @@ uv run modal run modal_run.py +  --script trition_tutorial/group_gemm/check.py +
 
 raw-pointer 구현이 통과한 뒤:
 
-1. `@triton.autotune(key=["group_size"])`
-2. Hopper 이상에서 problem별 `tl.make_tensor_descriptor`
-3. B를 `[N, K]`로 저장해 descriptor-friendly load
-4. FP8
+1. problem별 stride metadata를 추가해 non-contiguous layout 지원
+2. `@triton.autotune(key=["group_size"])`
+3. Hopper 이상에서 problem별 `tl.make_tensor_descriptor`
+4. B를 `[N, K]`로 저장해 descriptor-friendly load
+5. FP8
 
 TMA 버전에서도 flattened scheduling은 그대로고, A/B/C tile을 읽고 쓰는 방식만 descriptor로 바뀐다.
 
@@ -211,7 +212,7 @@ TMA 버전에서도 flattened scheduling은 그대로고, A/B/C tile을 읽고 �
 - `problem_start`를 현재 problem 뒤에서 갱신하지 않음
 - problem 내부 tile id와 전체 flattened tile id를 혼동함
 - `tile_id += NUM_PROGRAMS`를 빠뜨려 loop가 끝나지 않음
-- 모든 문제의 stride가 같다고 가정함
+- contiguous 제한을 제거했는데 problem별 stride metadata를 추가하지 않음
 - metadata 준비 시간을 kernel 성능으로 잘못 해석함
 
 ## 완료 조건

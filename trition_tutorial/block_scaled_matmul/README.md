@@ -11,7 +11,7 @@ Block-scaled Matmul은 네 주제 중 가장 나중에 하는 것이 좋다. GEM
 
 ```text
 block_scaled_matmul/
-├── block_scaled_matmul.py  # portable kernel + dot_scaled 확장 뼈대
+├── block_scaled_matmul.py  # explicit-scale portable kernel 뼈대
 ├── check.py                # 명시적 dequantize reference
 ├── benchmark.py            # explicit reference와 fused runtime 비교
 └── README.md
@@ -34,6 +34,7 @@ C       [M, N]              FP32 또는 FP16
 ```
 
 K는 첫 단계에서 `VEC_SIZE`의 배수로 제한한다. M/N은 tile 배수가 아니어도 된다.
+첫 뼈대는 pointer 식을 단순하게 보기 위해 네 입력을 모두 contiguous로 제한한다.
 
 ## block scaling의 의미
 
@@ -107,7 +108,9 @@ K tail을 나중에 지원한다면 payload뿐 아니라 scale load도 함께 ma
 ## 검증
 
 ```bash
-uv run modal run modal_run.py +  --script trition_tutorial/block_scaled_matmul/check.py +  --gpu B200
+uv run modal run modal_run.py \
+  --script trition_tutorial/block_scaled_matmul/check.py \
+  --gpu B200
 ```
 
 `check.py`는 `VEC_SIZE=16, 32`와 M/N irregular shape를 검사한다. 현재 wrapper의 `NotImplementedError`를 launch 코드로 바꾸고 TODO 1~4를 완성한다.
@@ -149,7 +152,13 @@ acc = tl.dot_scaled(
 )
 ```
 
-이때 `scale_a/scale_b`는 단순히 펼친 FP32 행렬이 아니다. `tl.dot_scaled`가 요구하는 scale dtype과 논리 shape을 맞춰야 한다. `_block_scaled_dot_kernel`의 TODO 5~7은 이 단계에서 완성한다.
+이때 `scale_a/scale_b`는 단순히 펼친 FP32 행렬이 아니다. `tl.dot_scaled`가 요구하는 scale dtype과 논리 shape을 맞춰야 한다.
+
+이 하드웨어 kernel은 첫 구현 파일에 빈 signature로 미리 넣지 않는다. explicit-scale kernel의 correctness와 benchmark를 끝낸 뒤 `_block_scaled_dot_kernel`을 새로 추가하고 다음 세 부분을 한 단계씩 구현한다.
+
+1. descriptor에서 저정밀 operand와 packed scale load
+2. scale을 `tl.dot_scaled`가 요구하는 2D 논리 shape으로 변환
+3. `tl.dot_scaled` 누적과 descriptor store
 
 공식 NVIDIA 경로는 A/B tile과 scale tile을 TensorDescriptor로 읽는다. B operand는 format에 따라 `[N, K]`로 저장한 뒤 kernel에서 논리적으로 transpose한다. 첫 API의 `B[K, N]`와 저장 layout이 다르다는 점에 주의한다.
 
