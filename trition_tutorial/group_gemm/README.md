@@ -30,7 +30,7 @@ outputs = group_gemm(group_a, group_b)
 
 첫 구현의 제약:
 
-- 각 A/B는 contiguous FP16 2D tensor
+- 각 A/B는 마지막 축이 contiguous인 FP16 2D tensor이며 row stride는 문제마다 달라도 됨
 - 문제마다 M/N/K가 달라도 됨
 - M/N/K tail 지원
 - output은 FP16, accumulator는 FP32
@@ -65,8 +65,9 @@ Python의 tensor list 자체를 Triton kernel에 넘길 수 없다. wrapper가 �
 | `group_b_ptrs` | `[G]` | 각 B의 address |
 | `group_c_ptrs` | `[G]` | 각 C의 address |
 | `group_sizes` | `[G, 3]` | 각 `(M, N, K)` |
+| `group_lds` | `[G, 3]` | 각 `(lda, ldb, ldc)` row stride |
 
-첫 뼈대는 모든 tensor를 contiguous로 제한하므로 stride metadata를 따로 만들지 않는다. A의 row stride는 `K`, B와 C의 row stride는 `N`에서 바로 얻는다. pointer tensor가 살아 있는 동안 원래 A/B/C tensor도 반드시 살아 있어야 한다. pointer 숫자만 남는다고 tensor 수명이 자동 보장되는 것은 아니다.
+각 problem은 shape뿐 아니라 row stride도 다를 수 있으므로 `group_sizes_ptr`와 `group_lds_ptr`를 따로 넘긴다. 현재 뼈대는 `stride(1) == 1`만 요구하고 `lda/ldb/ldc`는 metadata에서 읽는다. pointer tensor가 살아 있는 동안 원래 A/B/C tensor도 반드시 살아 있어야 한다. pointer 숫자만 남는다고 tensor 수명이 자동 보장되는 것은 아니다.
 
 kernel에서는 주소를 다시 typed pointer로 복원한다.
 
@@ -107,8 +108,8 @@ tile_n = tile_in_problem % num_n_tiles
 
 `_group_gemm_kernel`의 TODO를 다음 순서로 채운다.
 
-1. A/B/C raw address load와 FP16 pointer cast
-2. 현재 `M/N/K`와 `tile_m/tile_n`에서 pointer 계산
+1. A/B/C raw address와 `lda/ldb/ldc` load
+2. FP16 pointer cast 후 현재 `M/N/K`, tile 좌표, leading dimension으로 pointer 계산
 3. K loop와 FP32 `tl.dot`
 4. C store
 
@@ -144,6 +145,10 @@ offs_k = start_k + tl.arange(0, BLOCK_K)
 a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
 b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
 c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+
+a_ptrs = a_ptr + offs_m[:, None] * lda + offs_k[None, :]
+b_ptrs = b_ptr + offs_k[:, None] * ldb + offs_n[None, :]
+c_ptrs = c_ptr + offs_m[:, None] * ldc + offs_n[None, :]
 ```
 
 A/B의 범위 밖은 0으로 load한다. `check.py`의 뒤 두 irregular shape를 다시 활성화해 검증한다.
@@ -197,7 +202,7 @@ uv run modal run modal_run.py \
 
 raw-pointer 구현이 통과한 뒤:
 
-1. problem별 stride metadata를 추가해 non-contiguous layout 지원
+1. column stride까지 metadata를 확장해 임의의 2D layout 지원
 2. `@triton.autotune(key=["group_size"])`
 3. Hopper 이상에서 problem별 `tl.make_tensor_descriptor`
 4. B를 `[N, K]`로 저장해 descriptor-friendly load
@@ -212,7 +217,7 @@ TMA 버전에서도 flattened scheduling은 그대로고, A/B/C tile을 읽고 �
 - `problem_start`를 현재 problem 뒤에서 갱신하지 않음
 - problem 내부 tile id와 전체 flattened tile id를 혼동함
 - `tile_id += NUM_PROGRAMS`를 빠뜨려 loop가 끝나지 않음
-- contiguous 제한을 제거했는데 problem별 stride metadata를 추가하지 않음
+- `group_lds_ptr`에서 problem별 leading dimension을 읽지 않음
 - metadata 준비 시간을 kernel 성능으로 잘못 해석함
 
 ## 완료 조건

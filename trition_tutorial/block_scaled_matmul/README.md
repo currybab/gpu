@@ -34,7 +34,7 @@ C       [M, N]              FP32 또는 FP16
 ```
 
 K는 첫 단계에서 `VEC_SIZE`의 배수로 제한한다. M/N은 tile 배수가 아니어도 된다.
-첫 뼈대는 pointer 식을 단순하게 보기 위해 네 입력을 모두 contiguous로 제한한다.
+payload, scale, output의 각 축 stride는 kernel argument로 전달한다. 따라서 pointer 식은 `shape`로 row stride를 추측하지 않고 실제 tensor layout을 그대로 따른다.
 
 ## block scaling의 의미
 
@@ -81,7 +81,7 @@ acc += dot(a * scale_a, b * scale_b)
 scale_k = offs_k // VEC_SIZE
 ```
 
-A scale pointer는 `offs_m[:, None]`과 `scale_k[None, :]`를 쓰고, B scale pointer는 `scale_k[:, None]`과 `offs_n[None, :]`를 쓴다.
+A scale pointer는 `offs_m[:, None] * stride_asm`과 `scale_k[None, :] * stride_ask`를 쓴다. B scale pointer는 `scale_k[:, None] * stride_bsk`와 `offs_n[None, :] * stride_bsn`을 쓴다. payload와 C도 같은 방식으로 자신의 stride를 사용한다.
 
 시작 config:
 

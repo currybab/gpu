@@ -52,7 +52,7 @@ def attention(q, k, v, causal: bool, sm_scale: float):
 
 - CUDA FP16 self-attention
 - Q/K/V shape이 모두 `[B, H, N, D]`
-- Q/K/V 전체가 contiguous
+- Q/K/V/O의 `[B, H, N, D]` stride를 kernel argument로 전달
 - `16 <= D <= 128`
 - `N`이 tile 크기의 배수가 아닌 경우까지 처리
 - non-causal과 causal forward
@@ -96,7 +96,7 @@ uv run modal run modal_run.py \
 | shape `[B, H, N, D]` | 확인할 내용 |
 |---|---|
 | `[1, 2, 128, 64]` | 기본 block과 causal/non-causal |
-| `[2, 3, 129, 64]` | batch/head decode와 sequence tail |
+| `[2, 3, 129, 64]` | batch/head decode, sequence tail, padded row stride |
 | `[1, 2, 129, 80]` | `BLOCK_D=128` padding과 이중 tail |
 
 처음에는 첫 case만 남기고, 구현 순서에 맞춰 뒤 case를 다시 활성화해도 된다.
@@ -162,12 +162,14 @@ program 하나가 한 `(batch, head)`의 `BLOCK_M`개 query row를 담당한다.
 grid = (triton.cdiv(N, BLOCK_M), B * H)
 ```
 
-첫 뼈대는 contiguous 입력이므로 batch와 head를 따로 주소 계산할 필요 없이 `B * H`개의 head를 하나의 축으로 본다.
+grid에서는 `B * H`개의 head를 하나의 축으로 펴지만, 주소는 `N_HEADS`와 tensor별 batch/head stride를 사용해 계산한다.
 
 ```python
 query_block = tl.program_id(0)
 batch_head = tl.program_id(1)
-head_offset = batch_head * N * D
+batch_idx = batch_head // N_HEADS
+head_idx = batch_head % N_HEADS
+q_head_offset = batch_idx * stride_qb + head_idx * stride_qh
 ```
 
 program 내부 tile은 다음 shape을 가진다.
@@ -193,15 +195,20 @@ num_stages = 2
 
 `D`가 power of two가 아니면 `BLOCK_D`까지 padding해서 load하고 `offs_d < D` mask를 적용한다.
 
-## contiguous pointer로 주소 계산하기
+## pointer와 stride로 주소 계산하기
 
-첫 구현에서는 stride 일반화를 미루고 `[B, H, N, D]` contiguous tensor만 받는다. Q의 pointer tile은 다음 형태다.
+Q/K/V는 shape이 같아도 storage layout이 같다는 보장이 없다. 따라서 일반적인 Triton raw-pointer kernel처럼 각 tensor의 네 축 stride를 별도로 받는다. Q tile은 다음 형태다.
 
 ```python
 offs_m = query_block * BLOCK_M + tl.arange(0, BLOCK_M)
 offs_d = tl.arange(0, BLOCK_D)
 
-q_ptrs = Q + head_offset + offs_m[:, None] * D + offs_d[None, :]
+q_ptrs = (
+    q_ptr
+    + q_head_offset
+    + offs_m[:, None] * stride_qm
+    + offs_d[None, :] * stride_qd
+)
 q = tl.load(
     q_ptrs,
     mask=(offs_m[:, None] < N) & (offs_d[None, :] < D),
@@ -214,7 +221,12 @@ K/V는 key loop의 `offs_n`을 사용한다.
 ```python
 offs_n = start_n + tl.arange(0, BLOCK_N)
 
-k_ptrs = K + head_offset + offs_n[:, None] * D + offs_d[None, :]
+k_ptrs = (
+    k_ptr
+    + k_head_offset
+    + offs_n[:, None] * stride_kn
+    + offs_d[None, :] * stride_kd
+)
 k = tl.load(
     k_ptrs,
     mask=(offs_n[:, None] < N) & (offs_d[None, :] < D),
@@ -222,7 +234,7 @@ k = tl.load(
 )
 ```
 
-raw-pointer online softmax가 맞은 뒤 non-contiguous 입력이 필요할 때 Q/K/V/O stride를 kernel argument로 추가한다. 첫 단계에서 stride 인자 16개를 미리 넣지 않는다.
+인자가 길어 보이지만 역할은 단순하다. `*_ptr`는 storage 시작 주소이고 `stride_*`는 해당 축에서 한 칸 움직일 때 건너뛸 원소 수다. 이렇게 두면 online softmax 구현과 memory layout 가정을 분리할 수 있다.
 
 ## tail mask와 causal mask
 
@@ -277,8 +289,6 @@ def attention(q, k, v, causal: bool, sm_scale: float):
     assert q.dtype == k.dtype == v.dtype == torch.float16
     assert q.ndim == k.ndim == v.ndim == 4
     assert q.shape == k.shape == v.shape
-    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-
     batch, n_heads, n_ctx, head_dim = q.shape
     assert 16 <= head_dim <= 128
 
@@ -292,6 +302,11 @@ def attention(q, k, v, causal: bool, sm_scale: float):
         q, k, v, out,
         n_ctx,
         sm_scale,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *out.stride(),
+        N_HEADS=n_heads,
         HEAD_DIM=head_dim,
         CAUSAL=causal,
         BLOCK_M=block_m,
@@ -309,7 +324,7 @@ def attention(q, k, v, causal: bool, sm_scale: float):
 
 ### 1. Q를 O로 복사
 
-동일한 grid와 Q/O pointer 계산만 구현해 `out == q`를 확인한다. flattened batch-head offset, token tail, `D` padding을 먼저 검증한다.
+동일한 grid와 Q/O pointer 계산만 구현해 `out == q`를 확인한다. batch/head stride, token tail, `D` padding을 먼저 검증한다.
 
 ### 2. K/V block 하나만 계산
 

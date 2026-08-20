@@ -6,14 +6,21 @@ from persistent_matmul import matmul, persistent_matmul
 @torch.no_grad()
 def check_one(name, fn):
     torch.manual_seed(0)
-    for M, N, K in ((128, 128, 64), (257, 193, 97), (512, 384, 160)):
-        a = torch.randn((M, K), device="cuda", dtype=torch.float16)
-        b = torch.randn((K, N), device="cuda", dtype=torch.float16)
+    for M, N, K, padding in (
+        (128, 128, 64, 0),
+        (257, 193, 97, 7),
+        (512, 384, 160, 0),
+    ):
+        a = torch.randn((M, K + padding), device="cuda", dtype=torch.float16)[:, :K]
+        b = torch.randn((K, N + padding), device="cuda", dtype=torch.float16)[:, :N]
         expected = torch.matmul(a, b)
         actual = fn(a, b)
         error = (actual - expected).abs().max().item()
         torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
-        print(f"{name} passed: M={M}, N={N}, K={K}, max_abs_error={error:.6f}")
+        print(
+            f"{name} passed: M={M}, N={N}, K={K}, padding={padding}, "
+            f"max_abs_error={error:.6f}"
+        )
 
 
 if __name__ == "__main__":

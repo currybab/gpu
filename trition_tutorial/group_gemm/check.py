@@ -12,14 +12,14 @@ def check_group_gemm():
         (65, 129, 33),
         (193, 71, 160),
     )
-    group_a = [
-        torch.randn((M, K), device="cuda", dtype=torch.float16)
-        for M, _, K in shapes
-    ]
-    group_b = [
-        torch.randn((K, N), device="cuda", dtype=torch.float16)
-        for _, N, K in shapes
-    ]
+    group_a = []
+    group_b = []
+    for index, (M, N, K) in enumerate(shapes):
+        padding = index * 2
+        a_storage = torch.randn((M, K + padding), device="cuda", dtype=torch.float16)
+        b_storage = torch.randn((K, N + padding), device="cuda", dtype=torch.float16)
+        group_a.append(a_storage[:, :K])
+        group_b.append(b_storage[:, :N])
 
     expected = [torch.matmul(a, b) for a, b in zip(group_a, group_b)]
     actual = group_gemm(group_a, group_b)

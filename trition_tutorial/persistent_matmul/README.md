@@ -26,7 +26,24 @@ matmul(a, b)             # 1 program = 1 C tile
 persistent_matmul(a, b)  # 1 program = 여러 C tile
 ```
 
-입력은 row-major FP16 `A[M, K]`, `B[K, N]`이고 출력은 FP16 `C[M, N]`이다. 처음부터 M/N/K tail을 지원한다.
+입력은 FP16 `A[M, K]`, `B[K, N]`이고 출력은 FP16 `C[M, N]`이다. M/N/K tail뿐 아니라 tensor의 실제 stride도 처음부터 kernel에 전달한다.
+
+일반적인 Triton GEMM처럼 tensor 인자는 `a_ptr`, `b_ptr`, `c_ptr`로 이름을 붙이고, 각 축의 이동 폭은 별도 인자로 받는다.
+
+```python
+def _matmul_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+```
+
+`a_ptr`의 타입을 Python에서 따로 선언하지 않아도 launch 때 넘긴 CUDA tensor로부터 pointer type이 정해진다. 반면 stride는 주소 계산 규칙이므로 명시적으로 넘겨야 한다.
 
 ## 먼저 알아야 할 tiled GEMM
 
@@ -79,9 +96,9 @@ for tile_id in tl.range(start_tile, num_tiles, NUM_PROGRAMS):
 
 program이 GPU에 오래 남는다는 의미에서 persistent라고 부른다. launch/scheduling overhead를 줄이고 tile 사이의 pipeline을 발전시킬 여지가 생기지만, GPU의 동적 load balancing을 일부 포기한다. 따라서 항상 일반 GEMM보다 빠른 것은 아니다.
 
-## 첫 뼈대는 왜 row-major인가
+## 첫 tile ordering은 왜 row-major인가
 
-첫 구현에서는 linear tile id를 단순한 row-major 좌표로 바꾼다.
+여기서 row-major는 tensor의 memory layout이 아니라 output tile을 방문하는 순서를 뜻한다. 첫 구현에서는 linear tile id를 단순한 row-major 좌표로 바꾼다.
 
 ```python
 tile_m = tile_id // num_n_tiles
@@ -101,11 +118,11 @@ offs_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
 offs_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
 offs_k = tl.arange(0, BLOCK_K)
 
-a_ptrs = A + offs_m[:, None] * K + offs_k[None, :]
-b_ptrs = B + offs_k[:, None] * N + offs_n[None, :]
+a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
 ```
 
-K loop에서 A pointer는 `BLOCK_K`, B pointer는 `BLOCK_K * N`만큼 전진한다. 마지막 K tile은 `start_k + offs_k < K`로 mask하고 0을 채운다. stride 지원은 두 kernel이 맞은 뒤 wrapper와 pointer 식을 일반화하는 과제로 남긴다.
+K loop에서 A pointer는 `BLOCK_K * stride_ak`, B pointer는 `BLOCK_K * stride_bk`만큼 전진한다. 마지막 K tile은 `start_k + offs_k < K`로 mask하고 0을 채운다. C 주소도 `stride_cm`, `stride_cn`을 사용한다.
 
 ### accumulator와 store
 

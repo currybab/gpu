@@ -21,16 +21,17 @@ def check_attention(attention_fn):
     torch.manual_seed(0)
 
     cases = (
-        (1, 2, 128, 64),  # 기본 tile
-        (2, 3, 129, 64),  # sequence tail
-        (1, 2, 129, 80),  # BLOCK_D padding
+        (1, 2, 128, 64, 0),  # 기본 tile
+        (2, 3, 129, 64, 8),  # sequence tail + padded row stride
+        (1, 2, 129, 80, 0),  # BLOCK_D padding
     )
-    for batch, n_heads, n_ctx, head_dim in cases:
+    for batch, n_heads, n_ctx, head_dim, padding in cases:
         shape = (batch, n_heads, n_ctx, head_dim)
+        storage_shape = (batch, n_heads, n_ctx, head_dim + padding)
         sm_scale = head_dim**-0.5
-        q = torch.randn(shape, device="cuda", dtype=torch.float16)
-        k = torch.randn(shape, device="cuda", dtype=torch.float16)
-        v = torch.randn(shape, device="cuda", dtype=torch.float16)
+        q = torch.randn(storage_shape, device="cuda", dtype=torch.float16)[..., :head_dim]
+        k = torch.randn(storage_shape, device="cuda", dtype=torch.float16)[..., :head_dim]
+        v = torch.randn(storage_shape, device="cuda", dtype=torch.float16)[..., :head_dim]
 
         for causal in (False, True):
             expected = attention_reference(q, k, v, causal, sm_scale)
@@ -39,7 +40,7 @@ def check_attention(attention_fn):
 
             torch.testing.assert_close(actual, expected, atol=1e-2, rtol=0)
             print(
-                f"attention forward passed: shape={shape}, causal={causal}, "
+                f"attention forward passed: shape={shape}, padding={padding}, causal={causal}, "
                 f"max_abs_error={max_abs_error:.6f}"
             )
 
