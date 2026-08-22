@@ -10,6 +10,7 @@ def check_one(name, fn):
         (128, 128, 64, 0),
         (257, 193, 97, 7),
         (512, 384, 160, 0),
+        (1024, 1024, 512, 0),
     ):
         a = torch.randn((M, K + padding), device="cuda", dtype=torch.float16)[:, :K]
         b = torch.randn((K, N + padding), device="cuda", dtype=torch.float16)[:, :N]

@@ -11,10 +11,11 @@ def tflops(M, N, K, milliseconds):
 @torch.no_grad()
 def main():
     torch.manual_seed(0)
-    M, N, K = 4096, 4096, 512
+    M, N, K = 4096, 4096, 4096
     a = torch.randn((M, K), device="cuda", dtype=torch.float16)
     b = torch.randn((K, N), device="cuda", dtype=torch.float16)
-
+    print(f"M={M}, N={N}, K={K}")
+    
     implementations = (
         ("torch", lambda: torch.matmul(a, b)),
         ("basic", lambda: matmul(a, b)),
