@@ -16,6 +16,7 @@ persistent_matmul/
 ├── persistent_matmul.py  # 기본/persistent kernel 뼈대
 ├── check.py              # torch.matmul과 정확도 비교
 ├── benchmark.py          # runtime/TFLOPS 비교
+├── tune.py               # persistent config 정확도/성능 sweep
 └── README.md
 ```
 
@@ -190,6 +191,20 @@ uv run modal run modal_run.py \
   --gpu B200
 ```
 
+후보 config를 한 프로세스에서 비교할 때는 `tune.py`를 사용한다. 각 후보는 먼저 `torch.matmul`과 정확도를 비교하고, 통과한 경우에만 p20/median/p80 runtime과 TFLOPS를 측정한다. register, spill, shared memory도 config별 최초 launch에서 한 번 출력한다.
+
+```bash
+# 로컬 GPU
+uv run python trition_tutorial/persistent_matmul/tune.py
+
+# B200
+uv run modal run modal_run.py \
+  --script trition_tutorial/persistent_matmul/tune.py \
+  --gpu B200
+```
+
+`CONFIGS`의 tuple 순서는 `(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)`다. 최적 config는 GPU와 shape에 종속되므로 RTX 5090 결과를 그대로 B200 기본값으로 사용하지 않는다.
+
 측정 전 warmup하고 결과를 사용해 GPU 동기화를 보장한다. TFLOPS는 다음 식으로 계산한다.
 
 ```text
@@ -198,7 +213,7 @@ TFLOPS = 2 * M * N * K / (milliseconds * 1e9)
 
 변수는 한 번에 하나만 바꾼다.
 
-1. `NUM_PROGRAMS`: 실제 SM의 1/2, 1배
+1. `NUM_PROGRAMS`: 실제 SM의 1/2, 1배, 2배
 2. `BLOCK_M/BLOCK_N/BLOCK_K`
 3. `GROUP_SIZE_M`
 4. `num_warps`, `num_stages`

@@ -26,8 +26,8 @@ def check_one(name, fn):
 
 if __name__ == "__main__":
     for implementation_name, implementation in (
-        ("basic", matmul),
-        ("persistent", persistent_matmul),
+        ("naive tiled", matmul),
+        ("naive persistent", persistent_matmul),
     ):
         try:
             check_one(implementation_name, implementation)

@@ -1,28 +1,38 @@
 """기본 tiled GEMM을 persistent scheduling으로 바꾸는 실습 뼈대."""
 
+import re
 import torch
 import triton
 import triton.language as tl
 
 BLOCK_M = 128
-BLOCK_N = 128
+BLOCK_N = 64
 BLOCK_K = 32
 
-_PRINTED_KERNEL_METADATA: set[str] = set()
+_PRINTED_KERNEL_METADATA: set[tuple[object, ...]] = set()
 
 
-def _print_kernel_metadata_once(name: str, kernel, config: str) -> None:
-    if name in _PRINTED_KERNEL_METADATA:
+def _print_kernel_metadata_once(
+    name: str,
+    kernel,
+    config: str,
+    cache_key: tuple[object, ...],
+) -> None:
+    if cache_key in _PRINTED_KERNEL_METADATA:
         return
 
-    _PRINTED_KERNEL_METADATA.add(name)
+    _PRINTED_KERNEL_METADATA.add(cache_key)
     print("-" * 80)
     print(f"{name} kernel: {config}")
     print(f"regs/thread : {kernel.n_regs}")
     print(f"spills      : {kernel.n_spills}")
     print(f"shared/CTA  : {kernel.metadata.shared}")
     print(f"num_warps   : {kernel.metadata.num_warps}")
+    ptx = kernel.asm["ptx"]
+    ids = set(re.findall(r"bar\.sync\s+(\d+)", ptx)) | set(re.findall(r"barrier\.cta\.sync[.\w]*\s+(\d+)", ptx))
+    print(f"barriers    : {len(ids)}")
     print("-" * 80)
+
 
 @triton.jit
 def _matmul_kernel(
@@ -85,6 +95,7 @@ def _persistent_matmul_kernel(
     stride_cm,
     stride_cn,
     NUM_PROGRAMS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -95,7 +106,7 @@ def _persistent_matmul_kernel(
     num_n_tiles = tl.cdiv(N, BLOCK_N)
     num_tiles = num_m_tiles * num_n_tiles
 
-    for tile_id in tl.range(start_tile, num_tiles, NUM_PROGRAMS):
+    for tile_id in tl.range(start_tile, num_tiles, NUM_PROGRAMS, num_stages=NUM_STAGES):
         tile_m = tile_id // num_n_tiles
         tile_n = tile_id % num_n_tiles
 
@@ -112,7 +123,7 @@ def _persistent_matmul_kernel(
 
         # K축을 순회하며 FP32 acc에 tl.dot을 누적한다.
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for k in tl.range(0, K, BLOCK_K, num_stages=4):
+        for k in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
             offsets_k = k + tl.arange(0, BLOCK_K)
             mask_a = mask_m & (offsets_k[None, :] < K)
             mask_b = mask_n & (offsets_k[:, None] < K)
@@ -157,17 +168,30 @@ def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        num_warps=8,
+        num_warps=4,
     )
     _print_kernel_metadata_once(
         "naive tiled",
         k,
         f"BLOCK_M={BLOCK_M}, BLOCK_N={BLOCK_N}, BLOCK_K={BLOCK_K}",
+        ("naive tiled", BLOCK_M, BLOCK_N, BLOCK_K, 4),
     )
     return c
 
 
-def persistent_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def persistent_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    block_m: int = BLOCK_M,
+    block_n: int = BLOCK_N,
+    block_k: int = BLOCK_K,
+    num_warps: int = 4,
+    num_stages: int = 4,
+    programs_per_sm: int = 2,
+    maxnreg: int | None = None,
+    print_metadata: bool = True,
+) -> torch.Tensor:
     """README 2단계: 고정된 program들이 여러 output tile을 처리한다."""
     M, N, K = _shape(a, b)
     stride_am, stride_ak = a.stride()
@@ -175,10 +199,17 @@ def persistent_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     stride_cm, stride_cn = c.stride()
 
-    num_tiles = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-    num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count * 2
-    num_programs = min(num_sms, num_tiles)
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+    num_programs = min(num_sms * programs_per_sm, num_tiles)
     grid = (num_programs,)
+    launch_options = {
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+    if maxnreg is not None:
+        launch_options["maxnreg"] = maxnreg
+
     k = _persistent_matmul_kernel[grid](
         a,
         b,
@@ -193,18 +224,29 @@ def persistent_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         stride_cm,
         stride_cn,
         NUM_PROGRAMS=num_programs,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        num_warps=8,
-        maxnreg=128,
+        NUM_STAGES=num_stages,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        **launch_options,
     )
-    _print_kernel_metadata_once(
-        "persistent",
-        k,
-        (
-            f"BLOCK_M={BLOCK_M}, BLOCK_N={BLOCK_N}, BLOCK_K={BLOCK_K}, "
-            f"NUM_PROGRAMS={num_programs}"
-        ),
-    )
+    if print_metadata:
+        _print_kernel_metadata_once(
+            "naive persistent",
+            k,
+            (
+                f"BLOCK_M={block_m}, BLOCK_N={block_n}, BLOCK_K={block_k}, "
+                f"NUM_PROGRAMS={num_programs}, num_stages={num_stages}"
+            ),
+            (
+                "naive persistent",
+                block_m,
+                block_n,
+                block_k,
+                num_warps,
+                num_stages,
+                programs_per_sm,
+                maxnreg,
+            ),
+        )
     return c

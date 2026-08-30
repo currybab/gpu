@@ -18,8 +18,8 @@ def main():
     
     implementations = (
         ("torch", lambda: torch.matmul(a, b)),
-        ("basic", lambda: matmul(a, b)),
-        ("persistent", lambda: persistent_matmul(a, b)),
+        ("naive tiled", lambda: matmul(a, b)),
+        ("naive persistent", lambda: persistent_matmul(a, b, programs_per_sm=2)),
     )
     for name, fn in implementations:
         try:
