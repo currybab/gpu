@@ -1,6 +1,6 @@
 import torch
 
-from persistent_matmul import matmul, persistent_matmul
+from persistent_matmul import matmul, persistent_matmul, swizzle_matmul, persistent_swizzle_matmul
 
 
 @torch.no_grad()
@@ -11,6 +11,8 @@ def check_one(name, fn):
         (257, 193, 97, 7),
         (512, 384, 160, 0),
         (1024, 1024, 512, 0),
+        (1153, 193, 97, 7),  # M tile 10개: GROUP_SIZE_M=8의 마지막 그룹은 2개
+        (4096, 1024, 64, 0),  # 여러 그룹 + persistent program의 반복 처리
     ):
         a = torch.randn((M, K + padding), device="cuda", dtype=torch.float16)[:, :K]
         b = torch.randn((K, N + padding), device="cuda", dtype=torch.float16)[:, :N]
@@ -28,6 +30,10 @@ if __name__ == "__main__":
     for implementation_name, implementation in (
         ("naive tiled", matmul),
         ("naive persistent", persistent_matmul),
+        ("swizzle tiled (group=1)", lambda a, b: swizzle_matmul(a, b, group_size_m=1)),
+        ("swizzle tiled (group=8)", lambda a, b: swizzle_matmul(a, b, group_size_m=8)),
+        ("swizzle persistent (group=1)", lambda a, b: persistent_swizzle_matmul(a, b, group_size_m=1)),
+        ("swizzle persistent (group=8)", lambda a, b: persistent_swizzle_matmul(a, b, group_size_m=8)),
     ):
         try:
             check_one(implementation_name, implementation)

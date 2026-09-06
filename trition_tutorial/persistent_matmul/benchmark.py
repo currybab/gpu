@@ -1,7 +1,7 @@
 import torch
 import triton
 
-from persistent_matmul import matmul, persistent_matmul
+from persistent_matmul import matmul, persistent_matmul, swizzle_matmul, persistent_swizzle_matmul
 
 
 def tflops(M, N, K, milliseconds):
@@ -20,6 +20,8 @@ def main():
         ("torch", lambda: torch.matmul(a, b)),
         ("naive tiled", lambda: matmul(a, b)),
         ("naive persistent", lambda: persistent_matmul(a, b, programs_per_sm=2)),
+        ("swizzle tiled", lambda: swizzle_matmul(a, b, group_size_m=8)),
+        ("swizzle persistent", lambda: persistent_swizzle_matmul(a, b, group_size_m=8, programs_per_sm=2)),
     )
     for name, fn in implementations:
         try:

@@ -20,11 +20,13 @@ persistent_matmul/
 └── README.md
 ```
 
-공개 함수는 두 개다.
+공개 함수는 다음과 같다. swizzle 버전은 3단계 실습 뼈대다.
 
 ```python
 matmul(a, b)             # 1 program = 1 C tile
 persistent_matmul(a, b)  # 1 program = 여러 C tile
+swizzle_matmul(a, b, group_size_m=8)
+persistent_swizzle_matmul(a, b, group_size_m=8)
 ```
 
 입력은 FP16 `A[M, K]`, `B[K, N]`이고 출력은 FP16 `C[M, N]`이다. M/N/K tail뿐 아니라 tensor의 실제 stride도 처음부터 kernel에 전달한다.
@@ -168,14 +170,48 @@ uv run modal run modal_run.py \
 
 ## 3단계: grouped ordering
 
-두 kernel의 row-major 버전이 맞은 뒤 linear tile mapping만 grouped ordering으로 교체한다. `GROUP_SIZE_M`개의 M tile을 한 묶음으로 두고 묶음 안에서 N 방향으로 진행하면 가까운 program이 A/B tile을 L2에서 재사용할 가능성이 커진다.
+이번 실습은 **program에 배정하는 output tile 좌표의 swizzling**이다. tensor의 stride나 shared memory layout은 그대로 둔다. 기존 두 kernel을 기준으로 파일 아래쪽에 다음 뼈대를 추가했다.
 
-일반/persistent kernel이 같은 mapping helper를 사용하게 만들고 다음을 비교한다.
+| 기준 kernel | 구현할 kernel | launch 함수 |
+| --- | --- | --- |
+| `_matmul_kernel` | `_swizzle_matmul_kernel` | `swizzle_matmul` |
+| `_persistent_matmul_kernel` | `_persistent_swizzle_matmul_kernel` | `persistent_swizzle_matmul` |
 
-- `GROUP_SIZE_M=1`: 사실상 단순 ordering
-- `GROUP_SIZE_M=8`: 첫 최적화 후보
+pointer, mask, K loop, `tl.dot`, store와 launch 코드는 복사되어 있다. 두 새 kernel에서 **SWIZZLE 1~3**만 구현하면 된다. 현재 좌표 계산 두 줄은 row-major 임시값이며, wrapper의 `raise NotImplementedError`가 미구현 상태를 `pending`으로 알린다. 각 kernel의 mapping을 완성한 뒤 해당 wrapper의 `raise`를 삭제한다.
 
-mapping을 바꿔도 각 C tile을 정확히 한 번씩 방문하는지 작은 tile 좌표를 출력하거나 별도 Python 함수로 먼저 확인한다.
+### 어떤 순서로 바꾸나
+
+`GROUP_SIZE_M`은 원소 행 수가 아니라 **M축 tile 개수**다. M tile 여러 개를 그룹으로 묶고, 그룹 안에서는 M을 먼저 증가시키고 그다음 N을 증가시킨다. 같은 N tile의 B 데이터를 가까운 program들이 L2에서 재사용할 기회를 만드는 방식이다. 실제 GPU 실행 순서나 성능 향상을 보장하지는 않는다. [공식 튜토리얼의 L2 Cache Optimizations](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html#l2-cache-optimizations)를 참고한다.
+
+예를 들어 M tile 5개, N tile 3개, `GROUP_SIZE_M=2`라면 `(tile_m, tile_n)` 순서는 다음과 같다.
+
+```text
+row-major 처음 6개: (0,0) (0,1) (0,2) (1,0) (1,1) (1,2)
+group 0:          (0,0) (1,0) (0,1) (1,1) (0,2) (1,2)
+group 1:          (2,0) (3,0) (2,1) (3,1) (2,2) (3,2)
+group 2:          (4,0)       (4,1)       (4,2)
+```
+
+### TODO 구현 순서
+
+1. **SWIZZLE 1 — 그룹 찾기.** 정상 크기 그룹의 tile 수 `num_tiles_in_group`을 구한다. `tile_id`가 몇 번째 그룹인지 `group_id`, 그 그룹의 첫 M tile이 어디인지 `first_tile_m`을 계산한다.
+2. **SWIZZLE 2 — 마지막 그룹 처리.** `group_size_m`은 `GROUP_SIZE_M`과 남은 M tile 수 중 작은 값이다. Triton에서는 `tl.minimum`을 사용한다. 위 예제의 마지막 그룹에서는 2가 아니라 1이다.
+3. **SWIZZLE 3 — 그룹 내부 좌표.** 그룹 내부 linear id를 구하고, 나머지로 M축 상대 위치, 몫으로 N축 위치를 만든다. 나눗셈 기준은 실제 `group_size_m`이다. M축 상대 위치에 `first_tile_m`을 더한다. 임시 row-major 두 줄을 이 좌표로 교체한다.
+
+먼저 `_swizzle_matmul_kernel`에 구현한다. 이어 같은 mapping을 `_persistent_swizzle_matmul_kernel`의 **tile loop 안**에 넣는다. persistent에서는 `tl.program_id(0)`가 아니라 매 iteration의 **`tile_id`**를 변환해야 한다. `NUM_PROGRAMS` 간격의 loop와 grid는 그대로 유지한다.
+
+### 구현 후 확인
+
+```bash
+uv run python trition_tutorial/persistent_matmul/check.py
+uv run python trition_tutorial/persistent_matmul/benchmark.py
+```
+
+`check.py`에는 두 swizzle 버전의 `group_size_m=1, 8` 비교가 연결되어 있다. 1은 row-major와 같아야 하고, 8은 그룹보다 M tile이 적은 경우와 마지막 그룹이 짧은 경우에도 맞아야 한다. 기본 block 설정에서 `M=1153`은 M tile 10개로 마지막 그룹 크기가 2다. `M=4096, N=1024`는 여러 그룹과 persistent 반복 처리를 확인한다.
+
+수치 비교에 앞서 위 작은 예제를 Python으로 직접 나열해 모든 좌표가 범위 안에 있고, 중복 없이 정확히 `num_m_tiles * num_n_tiles`개인지 확인해보자. row-major 임시값도 matmul 정답은 맞으므로, **정확도 통과만으로 swizzling 구현 여부를 판단할 수는 없다.**
+
+성능은 `naive tiled ↔ swizzle tiled`, `naive persistent ↔ swizzle persistent`끼리 비교한다. shape, block 크기, warps, stages, programs_per_sm을 동일하게 두고 `group_size_m=1, 2, 4, 8, 16`만 바꿔본다. `tune.py`는 기존 naive persistent config sweep이므로 이 단계의 swizzle 비교는 `benchmark.py`에서 한다.
 
 ## 4단계: 성능 실험
 
@@ -184,6 +220,8 @@ mapping을 바꿔도 각 C tile을 정확히 한 번씩 방문하는지 작은 t
 - `torch.matmul`
 - 기본 `matmul`
 - `persistent_matmul`
+- `swizzle_matmul`
+- `persistent_swizzle_matmul`
 
 ```bash
 uv run modal run modal_run.py \
