@@ -16,3 +16,6 @@ dependencies = [
 dev = [
     "modal>=1.5.3",
 ]
+
+[tool.pyrefly]
+enable-fallback-search-path = true
