@@ -488,3 +488,154 @@ def persistent_swizzle_matmul(
             ),
         )
     return c
+
+
+# 5단계: cross-tile pipelining (compiler-assisted flattening) 실습
+
+
+@triton.jit
+def cross_tile_pipelining_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    NUM_PROGRAMS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    """실습: persistent tile loop를 flatten하여 타일 경계의 overlap을 시도한다."""
+    start_tile = tl.program_id(0)
+    num_m_tiles = tl.cdiv(M, BLOCK_M)
+    num_n_tiles = tl.cdiv(N, BLOCK_N)
+    num_tiles = num_m_tiles * num_n_tiles
+
+    # TODO CROSS 1: flatten=False를 True로 바꿔 중첩 loop flattening을 요청한다.
+    # 현재 형태는 비교용 이중 loop다. outer num_stages만으로 cross-tile을 보장하지 않는다.
+    # 다음 타일은 tile_id + NUM_PROGRAMS이며, 다음 좌표는 grouped mapping으로 구한다.
+    for tile_id in tl.range(
+        start_tile, num_tiles, NUM_PROGRAMS,
+        num_stages=NUM_STAGES,
+        flatten=True,
+    ):
+        num_tiles_in_group = GROUP_SIZE_M * num_n_tiles
+        group_id = tile_id // num_tiles_in_group
+        tile_id_in_group = tile_id % num_tiles_in_group
+        first_tile_m = group_id * GROUP_SIZE_M
+        group_size_m = tl.minimum(GROUP_SIZE_M, num_m_tiles - first_tile_m)
+        tile_m = first_tile_m + (tile_id_in_group % group_size_m)
+        tile_n = tile_id_in_group // group_size_m
+
+        # TODO CROSS 2: flatten 이후에도 아래 상태가 타일마다 새로 만들어지는지 확인한다.
+        # pointer는 현재 tile_m/tile_n 기준, acc는 0부터 시작해야 한다.
+        # compiler-assisted 실습에서는 이 초기화와 store의 소스 위치를 유지한다.
+
+        # a_ptr/b_ptr와 stride로 tile pointer와 M/N/K mask를 만든다.
+        offsets_m = tile_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offsets_n = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        a_row = a_ptr + offsets_m[:, None] * stride_am
+        b_col = b_ptr + offsets_n[None, :] * stride_bn
+        mask_m = offsets_m[:, None] < M
+        mask_n = offsets_n[None, :] < N
+
+        # K축을 순회하며 FP32 acc에 tl.dot을 누적한다.
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k in tl.range(0, K, BLOCK_K):
+            offsets_k = k + tl.arange(0, BLOCK_K)
+            mask_a = mask_m & (offsets_k[None, :] < K)
+            mask_b = mask_n & (offsets_k[:, None] < K)
+            a_tile = tl.load(a_row + offsets_k[None, :] * stride_ak, mask=mask_a, other=0.0)
+            b_tile = tl.load(b_col + offsets_k[:, None] * stride_bk, mask=mask_b, other=0.0)
+            acc = tl.dot(a_tile, b_tile, acc)
+
+        # TODO CROSS 3: K 전체 누적 후 현재 타일에 정확히 한 번 store되는지 검증한다.
+        # 여러 타일을 맡는 program, 마지막 K block, 마지막 M/N 타일을 확인한다.
+        tl.store(c_ptr + offsets_m[:, None] * stride_cm + offsets_n[None, :] * stride_cn, acc, mask=mask_m & mask_n)
+
+
+def cross_tile_pipelining_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    group_size_m: int = 8,
+    block_m: int = BLOCK_M,
+    block_n: int = BLOCK_N,
+    block_k: int = BLOCK_K,
+    num_warps: int = 4,
+    num_stages: int = 4,
+    programs_per_sm: int = 2,
+    maxnreg: int | None = None,
+    print_metadata: bool = True,
+) -> torch.Tensor:
+    """5단계 실습: 같은 grouped ordering에서 loop flattening의 효과를 비교한다."""
+    # TODO CROSS 4: 커널의 CROSS 1 적용 후 아래 raise를 삭제하고 check.py를 실행한다.
+    # CROSS 2~3은 상태/정확도 확인 항목이다. 성능 검증 방법은 README 5단계 참고.
+    M, N, K = _shape(a, b)
+    stride_am, stride_ak = a.stride()
+    stride_bk, stride_bn = b.stride()
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    stride_cm, stride_cn = c.stride()
+
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+    num_programs = min(num_sms * programs_per_sm, num_tiles)
+    grid = (num_programs,)
+    launch_options = {
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+    }
+    if maxnreg is not None:
+        launch_options["maxnreg"] = maxnreg
+
+    k = cross_tile_pipelining_kernel[grid](
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        NUM_PROGRAMS=num_programs,
+        NUM_STAGES=num_stages,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        GROUP_SIZE_M=group_size_m,
+        **launch_options,
+    )
+    if print_metadata:
+        _print_kernel_metadata_once(
+            "cross-tile persistent",
+            k,
+            (
+                f"BLOCK_M={block_m}, BLOCK_N={block_n}, BLOCK_K={block_k}, "
+                f"NUM_PROGRAMS={num_programs}, num_stages={num_stages}, GROUP_SIZE_M={group_size_m}"
+            ),
+            (
+                "cross-tile persistent",
+                block_m,
+                block_n,
+                block_k,
+                num_warps,
+                num_stages,
+                programs_per_sm,
+                maxnreg,
+                group_size_m,
+            ),
+        )
+    return c

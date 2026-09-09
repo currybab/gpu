@@ -258,6 +258,37 @@ TFLOPS = 2 * M * N * K / (milliseconds * 1e9)
 
 작은 K에서는 scheduling overhead 감소가 보일 수 있지만, tile 수가 SM에 고르게 나뉘지 않으면 persistent가 느려질 수 있다.
 
+## 5단계: cross-tile pipelining
+
+`persistent_matmul.py` 아래쪽의 `cross_tile_pipelining_kernel`과 호출 함수 `cross_tile_pipelining_matmul`을 사용한다. `_persistent_swizzle_matmul_kernel`의 grouped mapping, stride, mask, GEMM 본문과 launch 설정을 복사한 실습 뼈대다.
+
+기존 K-loop pipelining은 같은 C 타일 안에서 다음 K block의 load와 현재 block의 dot을 겹친다. Cross-tile pipelining은 한 persistent program이 맡는 **다음 C 타일**의 준비를 현재 타일 처리와 겹치는 것이 목표다. 다음 작업의 linear id는 `tile_id + NUM_PROGRAMS`이며, C의 바로 옆 타일이라는 뜻은 아니다.
+
+이번에는 compiler-assisted 방식부터 실습한다. 바깥 `tl.range`의 `flatten=True`는 중첩 loop를 펼치고 파이프라이닝하도록 컴파일러에 요청한다. 옵션을 지정한 것만으로 실제 cross-tile overlap이나 성능 향상이 보장되는 것은 아니다. [tl.range의 flatten 설명](https://triton-lang.org/main/python-api/generated/triton.language.range.html)을 참고한다.
+
+### TODO 진행 순서
+
+1. **CROSS 1 — loop flattening 요청.** 새 커널 바깥 tile loop의 `flatten=False`를 `True`로 바꾼다. 첫 비교에서는 `NUM_STAGES`, block 크기, warps, group 크기, program 수를 유지해 flattening의 영향을 살펴본다. 기존 커널에도 바깥/안쪽 loop의 `num_stages`가 있으므로, 기존 버전을 무조건 “파이프라이닝 없음”이라고 부르지 않는다.
+2. **CROSS 2 — 타일별 상태 확인.** 각 타일의 pointer를 현재 좌표에서 만들고 accumulator를 0으로 초기화하는 위치를 확인한다. 이 방식에서는 소스의 `acc` 초기화와 store 위치를 그대로 유지한다. 수동으로 다음 타일 pointer나 별도 accumulator를 추가하는 단계는 아니다.
+3. **CROSS 3 — 경계 정확도 검증.** 한 program이 여러 C 타일을 처리할 때도 매 타일의 K 누적이 끝난 뒤 그 타일에 한 번 저장되어야 한다. M/N/K tail과 비연속 stride도 확인한다.
+4. **CROSS 4 — 실행 연결.** wrapper의 `raise NotImplementedError`를 삭제하고 `check.py`를 실행한다. `benchmark.py`에는 `cross-tile persistent`가 연결되어 있다. 구현 전에는 두 스크립트에서 `pending`으로 표시된다.
+
+```bash
+uv run python trition_tutorial/persistent_matmul/check.py
+uv run python trition_tutorial/persistent_matmul/benchmark.py
+```
+
+`check.py`는 group=1/8을 각각 확인한다. 기본 설정에서 `4097×1025×97, padding=7`은 output tile이 561개여서 RTX 5090의 340개 program 중 일부가 두 번째 타일을 처리하고, M/N/K tail과 stride까지 함께 검증한다. 다른 GPU에서는 실제 `NUM_PROGRAMS`와 전체 tile 수를 비교해 반복 처리가 있는지 확인한다.
+
+### 효과 확인
+
+비교 기준은 같은 설정의 `persistent_swizzle_matmul`이다. M/N을 고정하고 K를 `128, 512, 4096`으로 바꿔, 타일 경계 비용이 상대적으로 큰 짧은 K에서 이득이 나타나는지 확인한다. `benchmark.py`는 현재 고정 shape 하나를 측정하므로 상단 M/N/K를 바꿔 실행한다.
+
+- 정확도 통과는 계산이 맞다는 뜻이며 cross-tile overlap이 생겼다는 증거는 아니다.
+- 실행 시간을 반복 비교하고 regs/thread, spills, shared/CTA도 함께 기록한다. 여러 iteration을 겹치면 살아 있는 데이터가 늘어 자원 사용량이 증가할 수 있다.
+- 컴파일 결과의 TTGIR/PTX/SASS를 비교해 loop 구조와 다음 타일 load의 배치를 살펴본다. 새 커널 launch 결과 `k.asm`에서 확인할 수 있다. ncu의 WarpStateStats/SourceCounters로 barrier와 데이터 대기 변화도 보되, 집계 지표만으로 overlap을 확정하지 않는다.
+- flattening이 적용되지 않거나 빨라지지 않아도 원인을 기록한다. 수동 flattened loop, TMA, warp specialization은 이 실험 이후의 확장이다.
+
 ## 이후 공식 튜토리얼 경로
 
 기본 raw-pointer persistent kernel 뒤에 다음 순서로 확장한다.
