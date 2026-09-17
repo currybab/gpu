@@ -322,3 +322,101 @@ TMA나 warp specialization이 persistent의 정의는 아니다. 핵심은 고�
 
 - [Triton Matrix Multiplication 튜토리얼](https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html)
 - [Triton Persistent Matmul 튜토리얼](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html)
+
+## 6단계: TMA tiled matmul 첫 실습
+
+기존 pointer 기반 tiled GEMM을 `TensorDescriptor`의 load/store로 바꾼다.
+TMA는 타일 전송 하드웨어 기능이고, 여기서 TensorDescriptor는 전체 tensor의
+shape·stride와 전송 tile 크기를 기술하는 호스트 인터페이스다.
+
+이번 범위는 **1 program = 1 C tile**, FP16 입력/출력, FP32 누적,
+`warp_specialize=False`다. 타일 좌표 계산과 launch는 준비되어 있다.
+
+### 구현 순서
+
+`persistent_matmul.py` 하단 TMA 실습의 TODO 1~4를 채운다.
+
+1. Python wrapper에서 A/B_T/C의 `TensorDescriptor`를 만든다.
+2. K loop에서 두 descriptor의 `.load([행 시작, 열 시작])`를 호출한다.
+3. B tile을 전치하여 `tl.dot`으로 FP32 accumulator에 누적한다.
+4. FP16으로 변환한 결과를 C descriptor의 `.store(...)`로 저장한다.
+
+완성한 뒤 wrapper의 `raise NotImplementedError`를 삭제한다. 뼈대 상태에서
+`check_tma.py`는 `pending`을 출력한다. 이는 정확도 통과가 아니다.
+
+### shape을 먼저 확인하기
+
+| 대상 | 전체 shape | descriptor block_shape |
+| --- | --- | --- |
+| A | `[M, K]` | `[64, 32]` |
+| B_T | `[N, K]` | `[64, 32]` |
+| C | `[M, N]` | `[64, 64]` |
+
+기존 함수는 B[K,N]을 받았지만 여기서는 `b_t = b.T.contiguous()`를 미리 만들어
+`tma_matmul(a, b_t)`에 넘긴다. descriptor의 마지막 축은 연속이어야 하므로
+단순 `.T` view만 넘기면 안 된다. 읽은 B tile의 shape도 `[BLOCK_N, BLOCK_K]`이므로
+연산할 때 전치한다. 수학적 결과는 그대로 `a @ b`다.
+
+`shape`는 전체 행렬, `block_shape`는 한 번에 읽거나 쓰는 tile 크기다.
+좌표와 stride는 원소 단위다. 기존의 원소별 pointer/mask 대신 tile의 시작 좌표를
+전달한다. 기본 zero padding으로 범위 밖 load는 0이 되며 범위 밖 store는 버려진다.
+
+이번 wrapper는 contiguous FP16으로 제한한다. 바깥 축 stride가 16-byte 정렬이어야
+하므로 K/N을 8의 배수로 받는다. M은 임의의 양수이며 K/N도 **tile 크기의 배수일 필요는 없다**.
+따라서 `(257, 200, 104)`는 세 축의 tail 처리를 확인한다.
+
+### 실행
+
+저장소 루트에서:
+
+```bash
+uv run python trition_tutorial/persistent_matmul/check_tma.py
+```
+
+Modal에서 실행하려면:
+
+```bash
+uv run modal run modal_run.py --script trition_tutorial/persistent_matmul/check_tma.py --gpu B200
+```
+
+정확도 통과 후 기존 pointer 버전의 `tl.load/tl.store`와 descriptor load/store를
+비교해보자. 전송 경로는 컴파일된 kernel의 `asm["ptx"]`에서
+`cp.async.bulk.tensor` 계열 명령을 찾아 확인할 수 있다.
+성능 비교 시 B 전치 복사 비용을 포함하는지 명시하고, block/warps/stages와
+타일 방문 순서를 맞춰야 한다. 현재 기존 pointer kernel과 설정은 다를 수 있다.
+
+다음 실습은 이 본문을 persistent tile loop에 옮기는 것이다. 이후
+`EPILOGUE_SUBTILE`, warp specialization 순으로 확장한다.
+
+참고: [공식 Persistent Matmul 튜토리얼](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html)의 TMA tiled 부분을 학습 범위의 기준으로 삼았다.
+
+## 7단계: TMA persistent matmul
+
+같은 파일 하단의 `_tma_persistent_matmul_kernel`과 `tma_persistent_matmul`을
+사용한다. 입력은 6단계와 같은 A[M,K], contiguous B_T[N,K]다.
+Descriptor 생성과 launch는 준비되어 있고 **TODO TMA P1~P4**가 구현할 부분이다.
+
+일반 TMA tiled에서는 program 하나가 C tile 하나를 맡았다. 여기서는
+`grid = min(SM 수, 전체 tile 수)`로 launch하고 program p가
+`p, p + NUM_PROGRAMS, p + 2 * NUM_PROGRAMS, ...` 타일을 처리한다.
+
+1. **P1:** persistent loop 안에서 현재 타일의 FP32 accumulator를 0으로 만든다.
+2. **P2:** TMA tiled의 descriptor load와 dot을 K loop 안에 옮긴다.
+3. **P3:** K 누적이 끝나면 현재 C 타일을 FP16으로 저장한다.
+4. **P4:** wrapper의 `raise NotImplementedError`를 삭제한다.
+
+Descriptor는 wrapper에서 한 번 만들고 재사용한다. 반면 시작 좌표와 accumulator는
+각 output tile마다 갱신해야 한다. `NUM_PROGRAMS`는 실제 grid 크기와 같다.
+
+```bash
+uv run python trition_tutorial/persistent_matmul/check_tma.py
+```
+
+검증 스크립트는 tiled/persistent를 각각 검사한다. 하나가 미구현이어도 다른 버전을
+검사하며, 마지막 shape은 GPU의 SM 수로부터 `2 * SM + 1`개 output tile을 만들어
+여러 타일 처리, 불균등한 마지막 반복, M/N/K tail을 함께 확인한다.
+
+첫 뼈대는 row-major 타일 순서와 `warp_specialize=False`를 사용한다.
+Persistent scheduling 자체가 타일 간 전송·연산 겹침이나 성능 향상을 보장하지는 않는다.
+먼저 정확도를 통과한 뒤 outer loop flattening과 pipeline 설정을 비교하고,
+이후 `EPILOGUE_SUBTILE`, warp specialization으로 확장한다.
