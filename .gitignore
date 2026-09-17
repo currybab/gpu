@@ -4,3 +4,4 @@
 .venv/
 __pycache__/
 **/AGENTS.md
+**/ir_dumps/
