@@ -668,45 +668,47 @@ def _tma_matmul_kernel(
     for start_k in tl.range(0, K, BLOCK_K, warp_specialize=False):
         # TODO 2: a_desc.load와 b_desc.load로 tile을 읽는다.
         # load에는 원소 단위 시작 좌표 두 개를 리스트로 전달한다.
-        # A의 축: [M, K], B_T의 축: [N, K]
-        # 결과 shape: a_tile[BLOCK_M, BLOCK_K], b_tile[BLOCK_N, BLOCK_K]
+        # A의 축: [M, K], B의 축: [K, N]
+        # load 좌표: A [start_m, start_k], B [start_k, start_n]
+        # 결과 shape: a_tile[BLOCK_M, BLOCK_K], b_tile[BLOCK_K, BLOCK_N]
         # tl.arange로 pointer를 만들거나 mask를 전달할 필요가 없다.
-        # TODO 3: b_tile을 전치하고 tl.dot으로 acc에 누적한다.
-        pass
+        a_tile = a_desc.load([start_m, start_k])
+        b_tile = b_desc.load([start_k, start_n])
+        # TODO 3: a_tile과 b_tile을 tl.dot으로 acc에 누적한다.
+        acc = tl.dot(a_tile, b_tile, acc)
 
     # TODO 4: acc를 FP16으로 변환하고 c_desc.store로 저장한다.
     # C의 축은 [M, N]. store(시작 좌표 리스트, 저장할 tile) 형태다.
+    c_tile = acc.to(tl.float16)
+    c_desc.store([start_m, start_n], c_tile)
 
 
-def tma_matmul(a: torch.Tensor, b_t: torch.Tensor) -> torch.Tensor:
-    """A[M,K] @ B_T[N,K].T -> C[M,N]. B_T는 미리 contiguous로 준비한다."""
-    assert a.is_cuda and b_t.is_cuda and a.device == b_t.device
+def tma_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """A[M,K] @ B[K,N] -> C[M,N]. 입력은 contiguous tensor다."""
+    assert a.is_cuda and b.is_cuda and a.device == b.device
     assert torch.version.cuda is not None, "NVIDIA CUDA 환경이 필요합니다."
     assert torch.cuda.get_device_capability(a.device)[0] >= 9, "TMA 지원 GPU가 필요합니다."
-    assert a.ndim == b_t.ndim == 2
-    assert a.dtype == b_t.dtype == torch.float16
-    assert a.is_contiguous() and b_t.is_contiguous()
+    assert a.ndim == b.ndim == 2
+    assert a.dtype == b.dtype == torch.float16
+    assert a.is_contiguous() and b.is_contiguous()
     M, K = a.shape
-    N, K_b = b_t.shape
+    K_b, N = b.shape
     assert K == K_b and min(M, N, K) > 0
     # FP16 row stride의 16-byte 정렬. tile 배수일 필요는 없다.
     assert K % 8 == 0 and N % 8 == 0, "첫 실습에서는 K/N을 8의 배수로 사용합니다."
-    assert a.data_ptr() % 16 == 0 and b_t.data_ptr() % 16 == 0
+    assert a.data_ptr() % 16 == 0 and b.data_ptr() % 16 == 0
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     # TODO 1: TensorDescriptor(base=..., shape=[...], strides=[...],
     #                          block_shape=[...])로 아래 None 세 개를 교체한다.
     # shape/strides는 전체 tensor의 정보, block_shape는 load/store 한 번의 크기다.
     # a_desc: base=a,   축 [M,K], block [TMA_BLOCK_M,TMA_BLOCK_K]
-    # b_desc: base=b_t, 축 [N,K], block [TMA_BLOCK_N,TMA_BLOCK_K]
+    # b_desc: base=b,   축 [K,N], block [TMA_BLOCK_K,TMA_BLOCK_N]
     # c_desc: base=c,   축 [M,N], block [TMA_BLOCK_M,TMA_BLOCK_N]
     # stride는 byte가 아닌 원소 단위이며 tensor.stride()에서 얻는다.
-    a_desc = None
-    b_desc = None
-    c_desc = None
-
-    # TODO 1~4를 모두 구현한 뒤 이 raise를 삭제한다.
-    raise NotImplementedError("persistent_matmul.py의 TMA TODO 1~4를 채운 뒤 이 raise를 삭제하세요.")
+    a_desc = TensorDescriptor(base=a, shape=[M, K], strides=[a.stride(0), a.stride(1)], block_shape=[TMA_BLOCK_M, TMA_BLOCK_K])
+    b_desc = TensorDescriptor(base=b, shape=[K, N], strides=[b.stride(0), b.stride(1)], block_shape=[TMA_BLOCK_K, TMA_BLOCK_N])
+    c_desc = TensorDescriptor(base=c, shape=[M, N], strides=[c.stride(0), c.stride(1)], block_shape=[TMA_BLOCK_M, TMA_BLOCK_N])
 
     grid = (triton.cdiv(M, TMA_BLOCK_M) * triton.cdiv(N, TMA_BLOCK_N),)
     _tma_matmul_kernel[grid](
@@ -743,30 +745,35 @@ def _tma_persistent_matmul_kernel(
 
         # TODO TMA P1: 현재 C tile의 FP32 accumulator를 0으로 만든다.
         # shape은 [BLOCK_M, BLOCK_N]. 반드시 persistent loop 안에서 초기화한다.
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         for start_k in tl.range(0, K, BLOCK_K, warp_specialize=False):
-            # TODO TMA P2: tiled 버전의 descriptor load와 dot을 옮긴다.
-            # A 좌표 [start_m, start_k], B_T 좌표 [start_n, start_k].
-            # B_T tile은 [BLOCK_N, BLOCK_K]이므로 dot에서 전치한다.
-            pass
+            # A[M,K], B[K,N]에서 현재 타일을 읽는다.
+            a_tile = a_desc.load([start_m, start_k])
+            b_tile = b_desc.load([start_k, start_n])
+            # TODO TMA P2: tl.dot(a_tile, b_tile, acc)로 누적한다.
+            # a_tile[BLOCK_M, BLOCK_K] @ b_tile[BLOCK_K, BLOCK_N].
+            acc = tl.dot(a_tile, b_tile, acc)
 
         # TODO TMA P3: K loop가 끝나면 FP16으로 변환하고 현재 C tile을 저장한다.
         # store는 persistent loop 안, K loop 밖에 있어야 한다.
+        c_tile = acc.to(tl.float16)
+        c_desc.store([start_m, start_n], c_tile)
 
 
-def tma_persistent_matmul(a: torch.Tensor, b_t: torch.Tensor) -> torch.Tensor:
-    """A[M,K] @ B_T[N,K].T. TMA tiled와 같은 입력, persistent scheduling."""
-    assert a.is_cuda and b_t.is_cuda and a.device == b_t.device
+def tma_persistent_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """A[M,K] @ B[K,N]. TMA tiled와 같은 입력, persistent scheduling."""
+    assert a.is_cuda and b.is_cuda and a.device == b.device
     assert torch.version.cuda is not None, "NVIDIA CUDA 환경이 필요합니다."
     assert torch.cuda.get_device_capability(a.device)[0] >= 9, "TMA 지원 GPU가 필요합니다."
-    assert a.ndim == b_t.ndim == 2
-    assert a.dtype == b_t.dtype == torch.float16
-    assert a.is_contiguous() and b_t.is_contiguous()
+    assert a.ndim == b.ndim == 2
+    assert a.dtype == b.dtype == torch.float16
+    assert a.is_contiguous() and b.is_contiguous()
     M, K = a.shape
-    N, K_b = b_t.shape
+    K_b, N = b.shape
     assert K == K_b and min(M, N, K) > 0
     assert K % 8 == 0 and N % 8 == 0, "첫 실습에서는 K/N을 8의 배수로 사용합니다."
-    assert a.data_ptr() % 16 == 0 and b_t.data_ptr() % 16 == 0
+    assert a.data_ptr() % 16 == 0 and b.data_ptr() % 16 == 0
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
 
     # Descriptor는 전체 tensor를 기술한다. tile마다 다시 만들지 않는다.
@@ -775,8 +782,8 @@ def tma_persistent_matmul(a: torch.Tensor, b_t: torch.Tensor) -> torch.Tensor:
         block_shape=[TMA_BLOCK_M, TMA_BLOCK_K],
     )
     b_desc = TensorDescriptor(
-        base=b_t, shape=[N, K], strides=list(b_t.stride()),
-        block_shape=[TMA_BLOCK_N, TMA_BLOCK_K],
+        base=b, shape=[K, N], strides=list(b.stride()),
+        block_shape=[TMA_BLOCK_K, TMA_BLOCK_N],
     )
     c_desc = TensorDescriptor(
         base=c, shape=[M, N], strides=list(c.stride()),
@@ -788,9 +795,7 @@ def tma_persistent_matmul(a: torch.Tensor, b_t: torch.Tensor) -> torch.Tensor:
     num_programs = min(num_sms, num_tiles)
     grid = (num_programs,)
 
-    # TODO TMA P4: P1~P3을 완성한 뒤 아래 raise를 삭제한다.
     # grid 크기와 kernel의 NUM_PROGRAMS는 같은 값이어야 한다.
-    raise NotImplementedError("TMA persistent의 TODO TMA P1~P4를 완성하세요.")
 
     _tma_persistent_matmul_kernel[grid](
         a_desc, b_desc, c_desc, M, N, K,

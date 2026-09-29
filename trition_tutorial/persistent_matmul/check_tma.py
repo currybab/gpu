@@ -14,8 +14,7 @@ def check_one(name, fn, shapes):
     for M, N, K in shapes:
         a = torch.randn((M, K), device="cuda", dtype=torch.float16)
         b = torch.randn((K, N), device="cuda", dtype=torch.float16)
-        b_t = b.T.contiguous()  # 단순 b.T view와 다름: 마지막 축 stride=1
-        actual = fn(a, b_t)
+        actual = fn(a, b)
         expected = a @ b
         torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
         error = (actual - expected).abs().max().item()

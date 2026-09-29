@@ -14,11 +14,9 @@ def main(M=16384, N=16384, K=4096):
     torch.manual_seed(0)
     a = torch.randn((M, K), device="cuda", dtype=torch.float16)
     b = torch.randn((K, N), device="cuda", dtype=torch.float16)
-    # TMA 입력 준비는 측정 밖에서 한 번만 수행한다.
-    b_t = b.T.contiguous()
     expected = torch.matmul(a, b)
     print(f"M={M}, N={N}, K={K}")
-    print("TMA: B.T.contiguous() 준비 비용 제외, warp_specialize=False")
+    print("TMA: contiguous B[K, N] 직접 사용, warp_specialize=False")
     
     implementations = (
         ("torch", lambda: torch.matmul(a, b)),
@@ -27,8 +25,8 @@ def main(M=16384, N=16384, K=4096):
         # ("swizzle tiled", lambda: swizzle_matmul(a, b, group_size_m=8)),
         # ("swizzle persistent", lambda: persistent_swizzle_matmul(a, b, group_size_m=8, programs_per_sm=2)),
         # ("cross-tile persistent", lambda: cross_tile_pipelining_matmul(a, b, group_size_m=8, programs_per_sm=2)),
-        ("TMA tiled", lambda: tma_matmul(a, b_t)),
-        ("TMA persistent", lambda: tma_persistent_matmul(a, b_t)),
+        ("TMA tiled", lambda: tma_matmul(a, b)),
+        ("TMA persistent", lambda: tma_persistent_matmul(a, b)),
     )
     for name, fn in implementations:
         try:

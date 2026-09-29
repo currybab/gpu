@@ -336,9 +336,9 @@ shape·stride와 전송 tile 크기를 기술하는 호스트 인터페이스다
 
 `persistent_matmul.py` 하단 TMA 실습의 TODO 1~4를 채운다.
 
-1. Python wrapper에서 A/B_T/C의 `TensorDescriptor`를 만든다.
+1. Python wrapper에서 A/B/C의 `TensorDescriptor`를 만든다.
 2. K loop에서 두 descriptor의 `.load([행 시작, 열 시작])`를 호출한다.
-3. B tile을 전치하여 `tl.dot`으로 FP32 accumulator에 누적한다.
+3. A tile과 B tile을 `tl.dot`으로 FP32 accumulator에 누적한다.
 4. FP16으로 변환한 결과를 C descriptor의 `.store(...)`로 저장한다.
 
 완성한 뒤 wrapper의 `raise NotImplementedError`를 삭제한다. 뼈대 상태에서
@@ -349,13 +349,13 @@ shape·stride와 전송 tile 크기를 기술하는 호스트 인터페이스다
 | 대상 | 전체 shape | descriptor block_shape |
 | --- | --- | --- |
 | A | `[M, K]` | `[64, 32]` |
-| B_T | `[N, K]` | `[64, 32]` |
+| B | `[K, N]` | `[32, 64]` |
 | C | `[M, N]` | `[64, 64]` |
 
-기존 함수는 B[K,N]을 받았지만 여기서는 `b_t = b.T.contiguous()`를 미리 만들어
-`tma_matmul(a, b_t)`에 넘긴다. descriptor의 마지막 축은 연속이어야 하므로
-단순 `.T` view만 넘기면 안 된다. 읽은 B tile의 shape도 `[BLOCK_N, BLOCK_K]`이므로
-연산할 때 전치한다. 수학적 결과는 그대로 `a @ b`다.
+기존 함수와 동일하게 contiguous B[K,N]을 `tma_matmul(a, b)`에 넘긴다.
+B descriptor의 shape은 `[K, N]`, block_shape은 `[BLOCK_K, BLOCK_N]`이다.
+`b_desc.load([start_k, start_n])`으로 읽고 `tl.dot(a_tile, b_tile, acc)`로
+누적한다. 입력 준비와 dot 모두 전치가 필요 없으며 결과는 `a @ b`다.
 
 `shape`는 전체 행렬, `block_shape`는 한 번에 읽거나 쓰는 tile 크기다.
 좌표와 stride는 원소 단위다. 기존의 원소별 pointer/mask 대신 tile의 시작 좌표를
@@ -382,7 +382,7 @@ uv run modal run modal_run.py --script trition_tutorial/persistent_matmul/check_
 정확도 통과 후 기존 pointer 버전의 `tl.load/tl.store`와 descriptor load/store를
 비교해보자. 전송 경로는 컴파일된 kernel의 `asm["ptx"]`에서
 `cp.async.bulk.tensor` 계열 명령을 찾아 확인할 수 있다.
-성능 비교 시 B 전치 복사 비용을 포함하는지 명시하고, block/warps/stages와
+성능 비교 시 block/warps/stages와
 타일 방문 순서를 맞춰야 한다. 현재 기존 pointer kernel과 설정은 다를 수 있다.
 
 다음 실습은 이 본문을 persistent tile loop에 옮기는 것이다. 이후
@@ -393,7 +393,7 @@ uv run modal run modal_run.py --script trition_tutorial/persistent_matmul/check_
 ## 7단계: TMA persistent matmul
 
 같은 파일 하단의 `_tma_persistent_matmul_kernel`과 `tma_persistent_matmul`을
-사용한다. 입력은 6단계와 같은 A[M,K], contiguous B_T[N,K]다.
+사용한다. 입력은 6단계와 같은 A[M,K], contiguous B[K,N]다.
 Descriptor 생성과 launch는 준비되어 있고 **TODO TMA P1~P4**가 구현할 부분이다.
 
 일반 TMA tiled에서는 program 하나가 C tile 하나를 맡았다. 여기서는
@@ -433,8 +433,8 @@ Persistent scheduling 자체가 타일 간 전송·연산 겹침이나 성능 �
 uv run python trition_tutorial/persistent_matmul/benchmark.py
 ```
 
-B는 `b.T.contiguous()`로 측정 전에 한 번 준비한다. 출력된 TMA 시간에는 이 전치
-복사 비용이 포함되지 않는다. 측정은 기존과 같이 output 할당과 descriptor 생성을
+모든 구현에 같은 contiguous B[K,N]을 전달하며 전치 복사는 수행하지 않는다.
+측정은 기존과 같이 output 할당과 descriptor 생성을
 포함하는 wrapper를 `triton.testing.do_bench`로 호출한다.
 기본 shape은 `(16384, 16384, 4096)`이며 작은 실험은 `main`의 기본값을 조정한다.
 
