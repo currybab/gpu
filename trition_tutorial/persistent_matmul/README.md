@@ -420,3 +420,24 @@ uv run python trition_tutorial/persistent_matmul/check_tma.py
 Persistent scheduling 자체가 타일 간 전송·연산 겹침이나 성능 향상을 보장하지는 않는다.
 먼저 정확도를 통과한 뒤 outer loop flattening과 pipeline 설정을 비교하고,
 이후 `EPILOGUE_SUBTILE`, warp specialization으로 확장한다.
+
+
+### TMA 성능 비교
+
+`benchmark.py`에 `TMA tiled`, `TMA persistent`가 연결되어 있다. 각 구현은
+같은 입력에 대한 `torch.matmul` 정확도 검사를 통과한 뒤 ms/TFLOPS를 출력한다.
+아직 `NotImplementedError`가 남아 있는 구현은 `pending`으로 표시하고 건너뛴다.
+정확도 실패는 측정하지 않고 오류로 중단한다.
+
+```bash
+uv run python trition_tutorial/persistent_matmul/benchmark.py
+```
+
+B는 `b.T.contiguous()`로 측정 전에 한 번 준비한다. 출력된 TMA 시간에는 이 전치
+복사 비용이 포함되지 않는다. 측정은 기존과 같이 output 할당과 descriptor 생성을
+포함하는 wrapper를 `triton.testing.do_bench`로 호출한다.
+기본 shape은 `(16384, 16384, 4096)`이며 작은 실험은 `main`의 기본값을 조정한다.
+
+현재 목록의 pointer 버전과 TMA 버전은 block 크기, tile 순서, program 수 등이
+다르므로 시간 차이를 TMA 전송만의 효과로 해석하면 안 된다. 먼저 TMA 두 버전의
+정확도와 성능을 확인하고, 전송 방식만 비교하려면 나머지 설정을 맞춘다.
