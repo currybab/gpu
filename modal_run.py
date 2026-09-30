@@ -11,6 +11,7 @@
 
 import os
 import pathlib
+import shlex
 
 import modal
 
@@ -44,11 +45,12 @@ app = modal.App("gpu-lab", image=image)
 
 
 @app.function(timeout=60 * 30)
-def run_script(rel_path: str, diagnostics: bool = False) -> dict[str, bytes]:
+def run_script(rel_path: str, diagnostics: bool = False, script_args: str = "") -> dict[str, bytes]:
     """저장소 안의 스크립트 하나를 __main__ 으로 실행하고, 생성된 산출물을 돌려준다."""
     import runpy
     import subprocess
     import sys
+    import tempfile
 
     import torch
     import triton
@@ -62,17 +64,24 @@ def run_script(rel_path: str, diagnostics: bool = False) -> dict[str, bytes]:
 
     script = pathlib.Path(REMOTE_REPO) / rel_path
     os.makedirs(REMOTE_OUT, exist_ok=True)
+    run_out = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=REMOTE_OUT))
+    os.environ["OUT_DIR"] = str(run_out)
     # 원격 컨테이너가 재사용되어도 이전 실행의 값이 남지 않게 매번 명시한다.
     os.environ[DIAGNOSTICS_ENV] = "1" if diagnostics else "0"
     # 스크립트가 같은 디렉토리의 모듈을 import 할 수 있게(예: task.py) 경로를 맞춘다.
     sys.path.insert(0, str(script.parent))
-    os.chdir(REMOTE_OUT)
+    os.chdir(run_out)
 
-    runpy.run_path(str(script), run_name="__main__")
+    previous_argv = sys.argv
+    try:
+        sys.argv = [str(script), *shlex.split(script_args)]
+        runpy.run_path(str(script), run_name="__main__")
+    finally:
+        sys.argv = previous_argv
 
     return {
         p.name: p.read_bytes()
-        for p in pathlib.Path(REMOTE_OUT).iterdir()
+        for p in run_out.iterdir()
         if p.is_file()
     }
 
@@ -82,8 +91,9 @@ def main(
     script: str = "trition_tutorial/fused_softmax/fused_softmax.py",
     gpu: str = "B200",
     diagnostics: bool = False,
+    script_args: str = "",
 ):
-    artifacts = run_script.with_options(gpu=gpu).remote(script, diagnostics)
+    artifacts = run_script.with_options(gpu=gpu).remote(script, diagnostics, script_args)
 
     if artifacts:
         out_dir = REPO / "modal_out" / gpu

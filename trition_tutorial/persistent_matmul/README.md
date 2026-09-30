@@ -487,3 +487,115 @@ uv run modal run modal_run.py --script trition_tutorial/persistent_matmul/benchm
 
 참고: [공식 Persistent Matmul 예제](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html),
 [`tl.range` API](https://triton-lang.org/main/python-api/generated/triton.language.range.html).
+
+## Shape별 TMA 파라미터 탐색 (Modal B200)
+
+`tune_tma.py`는 작성한 kernel을 직접 호출해 `TMA tiled`, `TMA persistent`,
+`WS off`, `WS on`을 각각 튜닝하고 `torch.mm`과 비교한다. 기존 wrapper의 고정
+기본값은 바꾸지 않는다. shape 표기는 **M×N×K**이며 입력은 FP16 A[M,K], B[K,N]이다.
+
+먼저 작은 smoke 실행으로 컴파일과 정확도를 확인한다.
+
+```bash
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/tune_tma.py \
+  --script-args '--preset smoke --max-seconds 300'
+```
+
+기본 탐색은 아래처럼 실행한다. 1024/2048/4096/8192 정사각형과
+`8192×2048×4096`, `2048×8192×4096`, `16384×16384×4096`을 검사한다.
+
+```bash
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/tune_tma.py \
+  --script-args '--preset quick --max-seconds 1200'
+```
+
+| Preset | BM/BN/BK 후보 | warps | stages | persistent programs/SM |
+|---|---|---|---|---|
+| smoke | 64/64/32, 128/128/64 | 4 | 2 | 1, 4 |
+| quick | 64/64/32, 128/64/64, 128/128/64, 128/256/64, 128/128/128, 128/256/128 | 4, 8 | 2, 3, 4 | 1, 2, 4 |
+| full | BM=64/128 × BN=64/128/256 × BK=32/64/128 | 4, 8 | 2, 3, 4 | 1, 2, 4 |
+
+`quick`은 shape당 tiled 36개, 나머지는 각각 108개 후보를 검사한다.
+초기 quick 탐색은 stage=3과 큰 BK=128 후보를 포함하지 않았으므로 그 결과를
+커널의 최적 성능으로 해석하지 않는다. 현재 quick은 이 후보들을 포함한다.
+Tiled의 programs/SM은 CSV에서 0으로 표시하며 전체 tile 수로 launch한다.
+Persistent의 실제 grid는 `min(SM 수 * programs_per_sm, tile 수)`다.
+작은 shape에서는 서로 다른 programs/SM 후보가 같은 grid가 될 수 있다.
+
+관심 shape만 더 촘촘히 탐색하거나 특정 구현만 골라 실행할 수 있다.
+
+```bash
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/tune_tma.py \
+  --script-args '--preset full --shapes 4096x4096x4096 8192x8192x8192 --variants ws_off ws_on --max-seconds 1200'
+
+# 같은 도구로 로컬 GPU에서 실행
+uv run python trition_tutorial/persistent_matmul/tune_tma.py \
+  --preset quick --shapes 4096x4096x4096
+```
+
+### 측정 기준과 결과 읽기
+
+- 모든 후보는 출력에 NaN을 채운 뒤 `torch.matmul` reference와 정확도를 비교한다.
+  컴파일/자원 부족과 정확도 실패는 기록하고 순위에서 제외한다. CUDA 실행 오류는
+  context가 손상됐을 수 있으므로 탐색을 중단한다.
+- 출력 할당, descriptor 생성, JIT 컴파일과 Python launch 비용을 제외한
+  **CUDA Graph 반복 실행 시간**을 측정한다. 동일한 입력을 재사용하므로 작은
+  행렬은 L2 cache 효과가 크다. 기존 wrapper 기반 `benchmark.py`와 측정 조건이 다르다.
+- FP16 입력, FP32 누적을 비교하며 PyTorch의 FP16 reduced-precision reduction은 끈다.
+  TFLOPS는 `2*M*N*K / (median_ms * 1e9)`다.
+- 후보 순서는 고정 seed로 섞는다. 기본 20ms 측정 후 구현별 상위 3개를 100ms씩
+  3회 재측정하고 각 통계의 중앙값으로 최종 순위를 정한다 (`--final-repeats`).
+  PyTorch도 탐색이 끝난 뒤 다시 측정한다. p20/median/p80, 반복별 중앙값과
+  register/spill/shared memory도 저장한다.
+- `--max-seconds`는 후보 사이에서 확인하는 시간 예산이다. 이미 시작한 컴파일/측정은
+  끝까지 진행한다. 예산이 끝나면 부분 결과를 저장하고 `complete=false`로 표시한다.
+  `screening_only`는 상위 후보 재측정까지 끝나지 않은 잠정 결과다.
+- **최고 TFLOPS는 탐색한 shape/config 범위 안의 최고값**이다. 각 구현의 최적값 비교와
+  WS 자체의 효과는 구분한다. WS 효과를 확인하려면 `all.csv`에서 shape와 모든 설정이
+  같은 `ws_off`/`ws_on` 행을 비교한다.
+
+Modal 결과는 `modal_out/B200/`, 로컬 결과는 `tuning_results/`에 저장한다.
+파일명에 UTC 시각을 붙여 실행 간 덮어쓰기를 피한다.
+
+| 파일 | 내용 |
+|---|---|
+| `*_all.csv` | 모든 시도와 실패 이유, 설정, 시간, 자원 사용량 |
+| `*_best.csv` | shape/구현별 최고 설정과 PyTorch 대비 배율 |
+| `*_summary.json` | GPU·Torch·Triton·kernel hash·탐색 범위·완료 여부와 최고 설정 |
+| `*_report.md` | 비교 표와 구현별 최대 TFLOPS를 낸 shape |
+| `*_best.png` | shape별 TFLOPS와 PyTorch 대비 배율 그래프 |
+
+`full`은 후보 수가 많으므로 관심 shape로 범위를 좁혀 사용하는 편이 좋다.
+측정 구현: [`triton.testing.do_bench_cudagraph`](https://triton-lang.org/main/python-api/generated/triton.testing.do_bench_cudagraph.html).
+
+### 공식 Persistent Matmul 예제와 비교
+
+```bash
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/benchmark_official.py \
+  --script-args '--size 4096'
+```
+
+`benchmark_official.py`는 공식 09 예제를 고정된 Git commit과 SHA256으로 내려받아
+원본 kernel과 autotune 후보를 사용한다. Raw tiled/persistent와 TMA tiled/persistent의
+WS off/on을 비교한다. CLC와 device-side descriptor 변형은 이 비교에서 제외한다.
+Autotune이 고른 설정을 고정하고 출력/descriptor를 미리 할당한 뒤 CUDA Graph로
+100ms씩 3회 측정한 중앙값을 기록한다. 공식 CLI의 Proton 측정을 그대로 실행하는
+것은 아니며, 이 저장소의 GPU 시간 측정 방식에 맞춘 비교다.
+
+공식 예제는 B를 미리 contiguous `[N,K]`로 저장한다. 공식 커널의 PyTorch 대비
+배율은 `torch.mm(a, b_transposed.T)`를 기준으로 계산한다. 기존 커널도 같은 GPU에서
+이전 4096³ 최고 설정으로 재측정하며, 이쪽은 원래 contiguous `[K,N]` PyTorch를
+기준으로 삼는다. `--size`를 바꿔도 기존 커널 설정은 다시 튜닝하지 않는다.
+전치 복사 비용은 GEMM 시간에 포함하지 않고 `transpose_copy_ms`로 별도 기록한다.
+모든 선택된 구현을 동일한 FP16 데이터의 reference와 검증한 뒤 측정한다.
+
+결과 JSON/CSV와 실행한 공식 Python 원본은 `modal_out/B200/`에 저장한다.
+
+`--tuned-configs`에 `tune_tma.Config` 필드를 담은 JSON을 전달하면 최초 quick 설정과
+새 설정을 같은 GPU/입력에서 번갈아 3회 재측정한다. 예를 들어
+`{"ws_on":{"block_m":128,"block_n":256,"block_k":64,"num_warps":4,"num_stages":3,"programs_per_sm":1}}`
+형식이다. 이는 설정 전달 예시이며 최고 설정이라는 의미는 아니다.

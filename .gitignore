@@ -5,3 +5,5 @@
 __pycache__/
 **/AGENTS.md
 **/ir_dumps/
+modal_out/
+tuning_results/
