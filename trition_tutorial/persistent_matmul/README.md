@@ -397,7 +397,7 @@ uv run modal run modal_run.py --script trition_tutorial/persistent_matmul/check_
 Descriptor 생성과 launch는 준비되어 있고 **TODO TMA P1~P4**가 구현할 부분이다.
 
 일반 TMA tiled에서는 program 하나가 C tile 하나를 맡았다. 여기서는
-`grid = min(SM 수, 전체 tile 수)`로 launch하고 program p가
+현재 튜닝 설정은 `grid = min(4 * SM 수, 전체 tile 수)`로 launch하고 program p가
 `p, p + NUM_PROGRAMS, p + 2 * NUM_PROGRAMS, ...` 타일을 처리한다.
 
 1. **P1:** persistent loop 안에서 현재 타일의 FP32 accumulator를 0으로 만든다.
@@ -413,7 +413,7 @@ uv run python trition_tutorial/persistent_matmul/check_tma.py
 ```
 
 검증 스크립트는 tiled/persistent를 각각 검사한다. 하나가 미구현이어도 다른 버전을
-검사하며, 마지막 shape은 GPU의 SM 수로부터 `2 * SM + 1`개 output tile을 만들어
+검사하며, 마지막 shape은 GPU의 SM 수로부터 `8 * SM + 1`개 output tile을 만들어
 여러 타일 처리, 불균등한 마지막 반복, M/N/K tail을 함께 확인한다.
 
 첫 뼈대는 row-major 타일 순서와 `warp_specialize=False`를 사용한다.
@@ -441,3 +441,49 @@ uv run python trition_tutorial/persistent_matmul/benchmark.py
 현재 목록의 pointer 버전과 TMA 버전은 block 크기, tile 순서, program 수 등이
 다르므로 시간 차이를 TMA 전송만의 효과로 해석하면 안 된다. 먼저 TMA 두 버전의
 정확도와 성능을 확인하고, 전송 방식만 비교하려면 나머지 설정을 맞춘다.
+
+## 8단계: Warp specialization 실습
+
+`persistent_matmul.py` 하단의 `_tma_warp_specialized_matmul_kernel`과
+`tma_warp_specialized_matmul`을 완성한다. Descriptor 생성, persistent scheduling,
+launch와 메타데이터 출력은 준비되어 있다. 첫 설정은 기존 TMA와 같은
+`BLOCK_M/N/K=128/128/64`, `num_warps=4`, `num_stages=2`, 최대 `4 * SM` programs다.
+입력은 contiguous FP16 `A[M,K]`, `B[K,N]`이며 K/N은 8의 배수로 제한한다.
+
+Warp specialization은 전송과 계산 등의 작업을 서로 다른 warp 역할로 나누는
+최적화다. 이 실습에서는 `tl.range`의 자동 분할을 요청하며, warp ID 분기나
+barrier를 직접 작성하지 않는다. 먼저 Modal B200에서 진행하는 것을 권장한다.
+RTX 5090은 B200과 연산 명령과 자원 제약이 다르므로 별도로 검증한다.
+GPU 세대 검사만으로 특정 Triton 버전의 컴파일 성공이나 성능 향상을 보장하지 않는다.
+
+### TODO 순서
+
+1. **WS 1:** outer persistent loop의 `warp_specialize=False`를
+   `warp_specialize=WARP_SPECIALIZE`로 바꾼다. `flatten=True`는 유지한다.
+2. **WS 2:** inner K loop에 A/B descriptor load와 FP32 `tl.dot` 누적을 작성한다.
+   B는 `[K,N]`이므로 이 실습에서는 전치하지 않는다.
+3. **WS 3:** K loop 뒤에서 FP16 결과를 `[store_m, store_n]`에 저장한다.
+   store 좌표는 공식 예제의 pipelining 우회 방식처럼 별도 counter로 계산해 두었다.
+4. **WS 4:** wrapper의 `NotImplementedError`를 삭제한다.
+
+완성 전에는 `check_tma.py`와 `benchmark.py`의 두 WS 항목이 `pending`을 출력한다.
+이는 정확도 통과가 아니다. 완성 후 같은 커널의 `warp_specialize=False`와 `True`를
+각각 검증한다. small/full tile, M/N/K tail, program당 여러 output tile 처리를 포함한다.
+
+```bash
+uv run python trition_tutorial/persistent_matmul/check_tma.py
+uv run python trition_tutorial/persistent_matmul/benchmark.py
+
+uv run modal run modal_run.py --script trition_tutorial/persistent_matmul/check_tma.py --gpu B200
+uv run modal run modal_run.py --script trition_tutorial/persistent_matmul/benchmark.py --gpu B200
+```
+
+성능 비교는 **WS practice (False) 대 WS practice (True)**를 기준으로 한다.
+두 경로는 동일한 입력, 타일 크기, program 수와 stage 설정을 사용한다.
+기존 TMA persistent와는 store counter 구성도 다르므로 WS 효과만 비교하는 기준으로
+쓰지 않는다. 출력된 registers/spills/shared memory와 실행 시간을 함께 기록한다.
+`True`를 전달했다는 사실이나 barrier 개수만으로 실제 작업 겹침을 입증할 수는 없다.
+필요하면 컴파일된 IR/PTX와 profiler로 분할 결과를 확인한다.
+
+참고: [공식 Persistent Matmul 예제](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html),
+[`tl.range` API](https://triton-lang.org/main/python-api/generated/triton.language.range.html).

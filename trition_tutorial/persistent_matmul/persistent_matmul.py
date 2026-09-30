@@ -839,3 +839,116 @@ def tma_persistent_matmul(
             ),
         )
     return c
+
+
+# Warp specialization 실습: 같은 커널의 WS=False/True를 비교한다.
+@triton.jit
+def _tma_warp_specialized_matmul_kernel(
+    a_desc, b_desc, c_desc,
+    M, N, K,
+    NUM_PROGRAMS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+):
+    start_tile = tl.program_id(0)
+    num_n_tiles = tl.cdiv(N, BLOCK_N)
+    num_tiles = tl.cdiv(M, BLOCK_M) * num_n_tiles
+
+    # 공식 persistent 예제처럼 store 쪽 counter를 분리한다.
+    # load/store가 같은 loop-carried 좌표를 공유하는 pipelining 제약을 피한다.
+    tile_id_c = start_tile - NUM_PROGRAMS
+
+    # TODO WS 1: 아래 warp_specialize=False를 WARP_SPECIALIZE로 바꾼다.
+    # outer persistent loop에서 요청한다. inner K loop에는 중복 적용하지 않는다.
+    # warp 역할 분리와 동기화는 컴파일러가 구성한다.
+    for tile_id in tl.range(
+        start_tile, num_tiles, NUM_PROGRAMS,
+        flatten=True, warp_specialize=False,
+    ):
+        start_m = (tile_id // num_n_tiles) * BLOCK_M
+        start_n = (tile_id % num_n_tiles) * BLOCK_N
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        for start_k in range(0, K, BLOCK_K):
+            # TODO WS 2: A/B descriptor load와 tl.dot 누적을 작성한다.
+            # A[M,K]: [start_m, start_k] -> [BLOCK_M, BLOCK_K]
+            # B[K,N]: [start_k, start_n] -> [BLOCK_K, BLOCK_N]
+            # 기존 입력 layout을 유지하므로 B tile을 전치하지 않는다.
+            pass
+
+        tile_id_c += NUM_PROGRAMS
+        store_m = (tile_id_c // num_n_tiles) * BLOCK_M
+        store_n = (tile_id_c % num_n_tiles) * BLOCK_N
+        # TODO WS 3: acc를 FP16으로 바꾸고 [store_m, store_n]에 store한다.
+        # store는 K loop 밖, persistent loop 안에서 타일마다 한 번 실행한다.
+
+
+def tma_warp_specialized_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    warp_specialize: bool = True,
+    print_metadata: bool = True,
+) -> torch.Tensor:
+    """TMA persistent WS 실습. TODO 완성 후 같은 설정의 False/True를 비교한다."""
+    # TODO WS 4: WS 1~3을 구현한 뒤 이 raise를 삭제한다.
+    # 미완성 output이 정확도 검사/벤치마크에 들어가지 않도록 pending으로 둔다.
+    raise NotImplementedError("Warp specialization 실습: TODO WS 1~4를 구현하세요.")
+
+    assert a.is_cuda and b.is_cuda and a.device == b.device
+    assert torch.version.cuda is not None, "NVIDIA CUDA 환경이 필요합니다."
+    major, _ = torch.cuda.get_device_capability(a.device)
+    assert major >= 9, "TMA 지원 GPU가 필요합니다."
+    if warp_specialize:
+        assert major >= 10, "이 자동 WS 실습은 Blackwell GPU에서 진행하세요."
+    assert a.ndim == b.ndim == 2
+    assert a.dtype == b.dtype == torch.float16
+    assert a.is_contiguous() and b.is_contiguous()
+    M, K = a.shape
+    K_b, N = b.shape
+    assert K == K_b and min(M, N, K) > 0
+    assert K % 8 == 0 and N % 8 == 0, "K/N은 8의 배수로 사용합니다."
+    assert a.data_ptr() % 16 == 0 and b.data_ptr() % 16 == 0
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    a_desc = TensorDescriptor(
+        base=a, shape=[M, K], strides=list(a.stride()),
+        block_shape=[TMA_BLOCK_M, TMA_BLOCK_K],
+    )
+    b_desc = TensorDescriptor(
+        base=b, shape=[K, N], strides=list(b.stride()),
+        block_shape=[TMA_BLOCK_K, TMA_BLOCK_N],
+    )
+    c_desc = TensorDescriptor(
+        base=c, shape=[M, N], strides=list(c.stride()),
+        block_shape=[TMA_BLOCK_M, TMA_BLOCK_N],
+    )
+    num_tiles = triton.cdiv(M, TMA_BLOCK_M) * triton.cdiv(N, TMA_BLOCK_N)
+    num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+    num_programs = min(num_sms * 4, num_tiles)
+
+    kernel = _tma_warp_specialized_matmul_kernel[(num_programs,)](
+        a_desc, b_desc, c_desc, M, N, K,
+        NUM_PROGRAMS=num_programs,
+        BLOCK_M=TMA_BLOCK_M, BLOCK_N=TMA_BLOCK_N, BLOCK_K=TMA_BLOCK_K,
+        WARP_SPECIALIZE=warp_specialize,
+        num_warps=4, num_stages=2,
+    )
+    if print_metadata:
+        _print_kernel_metadata_once(
+            "TMA WS practice",
+            kernel,
+            (
+                f"BLOCK_M={TMA_BLOCK_M}, BLOCK_N={TMA_BLOCK_N}, BLOCK_K={TMA_BLOCK_K}, "
+                f"NUM_PROGRAMS={num_programs}, num_stages={kernel.metadata.num_stages}, "
+                f"warp_specialize={warp_specialize}"
+            ),
+            (
+                "TMA WS practice", a.device, a.dtype, M, N, K, warp_specialize,
+                TMA_BLOCK_M, TMA_BLOCK_N, TMA_BLOCK_K, num_programs,
+                kernel.metadata.num_warps, kernel.metadata.num_stages,
+            ),
+        )
+    return c

@@ -3,6 +3,7 @@ import triton
 
 from persistent_matmul import matmul, persistent_matmul, swizzle_matmul, persistent_swizzle_matmul
 from persistent_matmul import cross_tile_pipelining_matmul, tma_matmul, tma_persistent_matmul
+from persistent_matmul import tma_warp_specialized_matmul
 
 
 def tflops(M, N, K, milliseconds):
@@ -16,7 +17,7 @@ def main(M=16384, N=16384, K=4096):
     b = torch.randn((K, N), device="cuda", dtype=torch.float16)
     expected = torch.matmul(a, b)
     print(f"M={M}, N={N}, K={K}")
-    print("TMA: contiguous B[K, N] 직접 사용, warp_specialize=False")
+    print("TMA: contiguous B[K, N] 직접 사용. WS practice는 False/True를 비교한다.")
     
     implementations = (
         ("torch", lambda: torch.matmul(a, b)),
@@ -27,6 +28,8 @@ def main(M=16384, N=16384, K=4096):
         # ("cross-tile persistent", lambda: cross_tile_pipelining_matmul(a, b, group_size_m=8, programs_per_sm=2)),
         ("TMA tiled", lambda: tma_matmul(a, b)),
         ("TMA persistent", lambda: tma_persistent_matmul(a, b)),
+        ("TMA WS practice (False)", lambda: tma_warp_specialized_matmul(a, b, warp_specialize=False)),
+        ("TMA WS practice (True)", lambda: tma_warp_specialized_matmul(a, b, warp_specialize=True)),
     )
     for name, fn in implementations:
         try:
