@@ -643,9 +643,9 @@ def cross_tile_pipelining_matmul(
 
 
 # TMA 실습: TensorDescriptor를 사용하는 일반 tiled GEMM
-TMA_BLOCK_M = 64
-TMA_BLOCK_N = 64
-TMA_BLOCK_K = 32
+TMA_BLOCK_M = 128
+TMA_BLOCK_N = 128
+TMA_BLOCK_K = 64
 
 
 @triton.jit
@@ -683,7 +683,7 @@ def _tma_matmul_kernel(
     c_desc.store([start_m, start_n], c_tile)
 
 
-def tma_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def tma_matmul(a: torch.Tensor, b: torch.Tensor, print_metadata: bool = True) -> torch.Tensor:
     """A[M,K] @ B[K,N] -> C[M,N]. 입력은 contiguous tensor다."""
     assert a.is_cuda and b.is_cuda and a.device == b.device
     assert torch.version.cuda is not None, "NVIDIA CUDA 환경이 필요합니다."
@@ -711,11 +711,26 @@ def tma_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     c_desc = TensorDescriptor(base=c, shape=[M, N], strides=[c.stride(0), c.stride(1)], block_shape=[TMA_BLOCK_M, TMA_BLOCK_N])
 
     grid = (triton.cdiv(M, TMA_BLOCK_M) * triton.cdiv(N, TMA_BLOCK_N),)
-    _tma_matmul_kernel[grid](
+    kernel = _tma_matmul_kernel[grid](
         a_desc, b_desc, c_desc, N, K,
         BLOCK_M=TMA_BLOCK_M, BLOCK_N=TMA_BLOCK_N, BLOCK_K=TMA_BLOCK_K,
         num_warps=4, num_stages=2,
     )
+    if print_metadata:
+        _print_kernel_metadata_once(
+            "TMA tiled",
+            kernel,
+            (
+                f"BLOCK_M={TMA_BLOCK_M}, BLOCK_N={TMA_BLOCK_N}, BLOCK_K={TMA_BLOCK_K}, "
+                f"num_stages={kernel.metadata.num_stages}, "
+                "warp_specialize=False"
+            ),
+            (
+                "TMA tiled", a.device, a.dtype, M, N, K,
+                TMA_BLOCK_M, TMA_BLOCK_N, TMA_BLOCK_K,
+                kernel.metadata.num_warps, kernel.metadata.num_stages,
+            ),
+        )
     return c
 
 
@@ -735,7 +750,7 @@ def _tma_persistent_matmul_kernel(
     num_tiles = num_m_tiles * num_n_tiles
 
     for tile_id in tl.range(
-        start_tile, num_tiles, NUM_PROGRAMS, warp_specialize=False,
+        start_tile, num_tiles, NUM_PROGRAMS, warp_specialize=False, flatten=True
     ):
         # tile_id는 매 iteration 달라진다. program_id로 좌표를 계산하면 안 된다.
         tile_m = tile_id // num_n_tiles
@@ -761,7 +776,12 @@ def _tma_persistent_matmul_kernel(
         c_desc.store([start_m, start_n], c_tile)
 
 
-def tma_persistent_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def tma_persistent_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    print_metadata: bool = True,
+) -> torch.Tensor:
     """A[M,K] @ B[K,N]. TMA tiled와 같은 입력, persistent scheduling."""
     assert a.is_cuda and b.is_cuda and a.device == b.device
     assert torch.version.cuda is not None, "NVIDIA CUDA 환경이 필요합니다."
@@ -792,15 +812,30 @@ def tma_persistent_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     num_tiles = triton.cdiv(M, TMA_BLOCK_M) * triton.cdiv(N, TMA_BLOCK_N)
     num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
-    num_programs = min(num_sms, num_tiles)
+    num_programs = min(num_sms * 4, num_tiles)
     grid = (num_programs,)
 
     # grid 크기와 kernel의 NUM_PROGRAMS는 같은 값이어야 한다.
 
-    _tma_persistent_matmul_kernel[grid](
+    kernel = _tma_persistent_matmul_kernel[grid](
         a_desc, b_desc, c_desc, M, N, K,
         NUM_PROGRAMS=num_programs,
         BLOCK_M=TMA_BLOCK_M, BLOCK_N=TMA_BLOCK_N, BLOCK_K=TMA_BLOCK_K,
         num_warps=4, num_stages=2,
     )
+    if print_metadata:
+        _print_kernel_metadata_once(
+            "TMA persistent",
+            kernel,
+            (
+                f"BLOCK_M={TMA_BLOCK_M}, BLOCK_N={TMA_BLOCK_N}, BLOCK_K={TMA_BLOCK_K}, "
+                f"NUM_PROGRAMS={num_programs}, num_stages={kernel.metadata.num_stages}, "
+                "warp_specialize=False"
+            ),
+            (
+                "TMA persistent", a.device, a.dtype, M, N, K,
+                TMA_BLOCK_M, TMA_BLOCK_N, TMA_BLOCK_K, num_programs,
+                kernel.metadata.num_warps, kernel.metadata.num_stages,
+            ),
+        )
     return c
