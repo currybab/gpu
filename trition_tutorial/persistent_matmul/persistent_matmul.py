@@ -865,7 +865,7 @@ def _tma_warp_specialized_matmul_kernel(
     # warp 역할 분리와 동기화는 컴파일러가 구성한다.
     for tile_id in tl.range(
         start_tile, num_tiles, NUM_PROGRAMS,
-        flatten=True, warp_specialize=False,
+        flatten=True, warp_specialize=WARP_SPECIALIZE,
     ):
         start_m = (tile_id // num_n_tiles) * BLOCK_M
         start_n = (tile_id % num_n_tiles) * BLOCK_N
@@ -876,13 +876,16 @@ def _tma_warp_specialized_matmul_kernel(
             # A[M,K]: [start_m, start_k] -> [BLOCK_M, BLOCK_K]
             # B[K,N]: [start_k, start_n] -> [BLOCK_K, BLOCK_N]
             # 기존 입력 layout을 유지하므로 B tile을 전치하지 않는다.
-            pass
+            a_tile = a_desc.load([start_m, start_k])
+            b_tile = b_desc.load([start_k, start_n])
+            acc = tl.dot(a_tile, b_tile, acc)
 
         tile_id_c += NUM_PROGRAMS
         store_m = (tile_id_c // num_n_tiles) * BLOCK_M
         store_n = (tile_id_c % num_n_tiles) * BLOCK_N
         # TODO WS 3: acc를 FP16으로 바꾸고 [store_m, store_n]에 store한다.
         # store는 K loop 밖, persistent loop 안에서 타일마다 한 번 실행한다.
+        c_desc.store([store_m, store_n], acc.to(tl.float16))
 
 
 def tma_warp_specialized_matmul(
@@ -893,9 +896,6 @@ def tma_warp_specialized_matmul(
     print_metadata: bool = True,
 ) -> torch.Tensor:
     """TMA persistent WS 실습. TODO 완성 후 같은 설정의 False/True를 비교한다."""
-    # TODO WS 4: WS 1~3을 구현한 뒤 이 raise를 삭제한다.
-    # 미완성 output이 정확도 검사/벤치마크에 들어가지 않도록 pending으로 둔다.
-    raise NotImplementedError("Warp specialization 실습: TODO WS 1~4를 구현하세요.")
 
     assert a.is_cuda and b.is_cuda and a.device == b.device
     assert torch.version.cuda is not None, "NVIDIA CUDA 환경이 필요합니다."
