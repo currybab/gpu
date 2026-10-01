@@ -488,6 +488,161 @@ uv run modal run modal_run.py --script trition_tutorial/persistent_matmul/benchm
 참고: [공식 Persistent Matmul 예제](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html),
 [`tl.range` API](https://triton-lang.org/main/python-api/generated/triton.language.range.html).
 
+## 9단계: Epilogue subtiling 실습
+
+`persistent_matmul.py` 하단의 `_tma_epilogue_matmul_kernel`과
+`tma_epilogue_matmul`에 전체/분할 저장 경로를 구현했다. K-loop와 FP32 누적은 기존 WS
+커널과 같고, `epilogue_subtile=False`는 전체 타일 저장, `True`는 두 조각으로 나눠
+저장하는 경로다. 두 경로 모두 정확도 검증을 완료했다. 비교할 때는 먼저 `warp_specialize=False`로
+고정해 저장 방식만 비교한다. B는 기존 contiguous `[K,N]`, 타일 순서는 row-major다.
+
+### 구현 순서 기록
+
+1. **EPI 1 — C descriptor:** `True`일 때 `c_desc.block_shape`의 N축 크기를
+   `block_n//2`로 바꾼다. 전체 C shape/strides, A/B descriptor와 grid는 그대로 둔다.
+2. **EPI 2 — accumulator 분리:** `tl.reshape`, `tl.permute`, `tl.split`을 이용해
+   `[BM,BN]`을 왼쪽/오른쪽 `[BM,BN//2]`로 나눈다. 코드의 shape 힌트를 따라간다.
+   `tl.split`은 마지막 크기 2인 축을 분리하므로 permute가 필요하다.
+3. **EPI 3 — 두 번 저장:** 두 조각을 각각 FP16으로 바꿔 저장한다.
+   오른쪽 시작 열은 `store_n + BLOCK_N//2`다. tile 간격 자체는 `BLOCK_N`이다.
+4. **EPI 4 — 실행:** wrapper의 미구현 `if/raise`를 제거하고 두 경로를 검증했다.
+
+### 작은 설정에서 정확도부터 확인
+
+```bash
+uv run python trition_tutorial/persistent_matmul/check_epilogue.py
+
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/check_epilogue.py
+```
+
+기본 설정은 `128/128/64`, warps=4, stages=2, programs/SM=1이다.
+검사에는 full tile, 오른쪽 절반 전체가 범위 밖인 경우, 오른쪽 일부만 유효한 경우,
+M/N/K tail과 program당 여러 C tile을 처리하는 경우가 포함된다.
+shape 검사와 비교 허용 오차는 기존 TMA 실습과 같다. pending이나 resource_limited는
+정확도 통과가 아니며, 출력이 틀리면 즉시 실패한다.
+
+### 고정 설정 비교와 shared memory 제한 확인
+
+정확도 통과 후 `--benchmark`로 False/True 시간을 비교한다. 같은 커널에서 flag만
+바꾸며, 기본 성능 측정 shape은 4096³이다.
+
+```bash
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/check_epilogue.py \
+  --script-args '--benchmark'
+
+# 기존 persistent가 shared memory 부족으로 실패했던 설정
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/check_epilogue.py \
+  --script-args '--block-n 256 --num-stages 4 --benchmark'
+```
+
+두 번째 실행의 목표는 **False의 자원 부족과 True의 실행 가능 여부**를 확인하는 것이다.
+False가 컴파일되지 않으면 같은 설정의 속도 향상 배율을 계산할 수 없다.
+먼저 둘 다 실행되는 설정에서 비교하고, 이후 True 경로의 타일/stage를 재튜닝한다.
+WS를 함께 비교할 때는 위 명령에 `--warp-specialize`를 추가한다.
+
+출력의 `shared/CTA`, registers/spills와 시간을 함께 기록한다.
+FP16 128×256 결과는 64 KiB, 절반인 128×128은 32 KiB다. 저장용 shared memory를
+줄이는 것이 목표이며 전체 accumulator나 shared memory 총량을 절반으로 만드는
+기능은 아니다. 실제 절약량은 컴파일 메타데이터로 확인한다.
+
+이 스크립트의 시간은 기존 `benchmark.py`처럼 wrapper를 `do_bench`로 측정한다.
+출력/descriptor를 미리 준비하는 `tune_tma.py`의 CUDA Graph 결과와 직접 비교하지 않는다.
+설정을 바꾼 뒤에는 먼저 이 실습 검사로 정확도를 확인한다.
+참고: [공식 epilogue subtiling 구현](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html).
+
+### Subtiling × stages × WS 조합 비교
+
+EPI 구현과 정확도 검사를 끝낸 뒤에는 아래 명령으로 같은 타일에서 조합별 효과를 본다.
+
+```bash
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/benchmark_epilogue.py
+```
+
+기본값은 4096³, `BM/BN/BK=128/256/64`, warps=4, programs/SM=1이다.
+stages 2/3/4/5 × WS False/True × subtiling False/True의 16개 조합을 검사한다.
+컴파일된 조합은 NaN으로 초기화한 출력의 정확도를 확인하고, 출력/descriptor를
+미리 준비한 CUDA Graph를 순서를 섞어 100ms씩 3회 측정한다.
+JSON/CSV/Markdown 결과는 `modal_out/B200/epilogue_*`에 저장한다.
+
+먼저 같은 stages/WS에서 subtiling만 비교한다. 그다음 각각의 경로에서 사용할 수 있는
+최고 stage 설정의 성능을 비교한다. 메모리 절약으로 더 높은 stage가 가능해지는 효과와
+동일 설정에서 저장 방식을 바꾼 효과를 구분한다. WS는 subtiling의 필수 조건이 아니며,
+stage 수를 늘렸다고 항상 빨라지는 것도 아니다.
+
+`--block-n 128`, `--num-warps 8`, `--programs-per-sm 2` 등으로 조건을 바꿀 수 있다.
+이 도구는 kernel을 직접 호출하고 각 조합의 정확도를 확인한 뒤 측정한다.
+
+### 구현 전체를 같은 GPU에서 재측정
+
+```bash
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/benchmark_all.py
+```
+
+4096³·FP16을 기본으로 raw tiled/persistent, swizzle, cross-tile, TMA, WS, epilogue,
+공식 예제 6종과 PyTorch를 한 GPU 할당에서 비교한다. 계산은 서로 간섭하지 않도록
+순서를 섞어 순차 실행하며, 100ms × 3회 CUDA Graph 측정의 중앙값을 사용한다.
+`--script-args '--size 4096 --rounds 5'`처럼 반복 수를 바꿀 수 있다.
+
+우리 커널은 현재 wrapper 기본값, 최초 quick 선택값, 확대 탐색 선택값을 구분한다.
+Epilogue는 기본값과 stages 2/3/4/5 × WS × subtiling 조합을 포함한다.
+이것은 기존 설정들의 통합 재측정이며 모든 구현을 새로 최적화하는 실험은 아니다.
+공식 예제는 고정된 원본 소스의 autotune을 이번 실행에서 수행해 설정을 선택한다.
+공식 CLC/device-side descriptor 변형은 지금까지의 학습 범위에 포함하지 않았다.
+
+`all_gemm_*.md/.csv/.json`에 각 행의 구현, 설정 출처, 정확도/컴파일 상태,
+B 배치, flatten/WS/subtiling, grouped ordering, 타일 크기, 요청·실제 warp 수,
+launch/loop stage, programs/SM·실제 grid와 시간·TFLOPS·shared memory를 기록한다.
+우리 입력은 B[K,N], 공식 입력은 사전 전치한 B[N,K]이며, 두 PyTorch 기준값을
+따로 측정한다. B 전치 복사 비용은 GEMM에 포함하지 않고 별도 기록한다.
+
+### 큰 TMA 타일의 제한된 비교
+
+```bash
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/check_large_tma_tiles.py
+```
+
+4096³·FP16, warps=8, persistent programs/SM=1을 고정하고
+`128/256/64`, `256/256/32`, `256/256/64` × stages 3/4 ×
+TMA tiled/persistent/WS/WS+subtiling의 24개 조합만 비교한다.
+통과한 조합은 50ms씩 3회 CUDA Graph로 측정하며 `large_tma_*.json/.csv/.md`로 저장한다.
+이 범위에서의 실패를 다른 stage/warp 설정에서도 실행 불가능하다는 뜻으로 해석하지 않는다.
+
+### Raw pointer·swizzle·cross-tile 확대 튜닝
+
+```bash
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/persistent_matmul/tune_raw.py \
+  --script-args '--preset full --size 4096 --top-k 5 --max-seconds 1500'
+```
+
+다섯 raw 구현을 `BM/BN={64,128,256}`, `BK={32,64,128}`, warps={4,8},
+stages={2,3,4}로 탐색한다. Persistent 구현은 programs/SM={1,2,4}도 비교한다.
+첫 탐색은 grouped 구현의 GROUP_SIZE_M=8을 고정해 총 1,782개 후보를 검사한다.
+그룹 크기는 구현별 상위 5개 후보에서 1/4/16/32로 추가 탐색하므로 전체 그룹 조합을
+전수 탐색했다는 의미는 아니다.
+
+Raw tiled/swizzle tiled의 기존 K-loop stages=4는 기본값을 유지한 `NUM_STAGES=4`
+인자로 바꿨다. 후보 탐색에서는 launch와 명시적 loop stage에 같은 값을 사용한다.
+기본값 비교는 기존대로 tiled의 launch=3 / K-loop=4, persistent의 launch=4 /
+명시적 loop=4를 유지한다. Cross-tile은 outer loop에 stage 값을 지정한다.
+
+모든 후보는 정확도 검사를 통과한 뒤 CUDA Graph로 측정한다. 컴파일/자원 제한은
+기록하고 건너뛰며, 정확도 실패나 CUDA 실행 오류는 중단한다. 탐색 후 기본값과 상위
+후보, PyTorch 및 기존 TMA 참고 설정들을 같은 GPU에서 순서를 섞어 100ms씩 3회
+측정한다. 기본값이 더 빠르면 기본값을 선택한다. `--max-seconds`는 탐색 단계에서
+후보 사이에 확인하는 예산이며, 시작한 컴파일과 최종 비교의 완료 시간은 별도다.
+
+`raw_tuning_*.json`, `*_trials.csv`, `*_comparison.csv`, `.md`가 결과다.
+완료 여부와 후보 범위를 확인한 뒤 해석한다. 작은 실행 점검에는 `--preset smoke`
+를 사용한다. 이 도구도 kernel 직접 호출이므로 결과가 기존 wrapper 기본값에
+자동 적용되지는 않는다.
+
 ## Shape별 TMA 파라미터 탐색 (Modal B200)
 
 `tune_tma.py`는 작성한 kernel을 직접 호출해 `TMA tiled`, `TMA persistent`,

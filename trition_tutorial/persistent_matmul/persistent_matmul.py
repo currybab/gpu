@@ -52,6 +52,7 @@ def _matmul_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr = 4,
 ):
     """1 program이 C tile 하나를 계산한다."""
     tile_id = tl.program_id(0)
@@ -69,7 +70,7 @@ def _matmul_kernel(
 
     # TODO 2: K축을 순회하며 FP32 acc에 tl.dot을 누적한다.
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in tl.range(0, K, BLOCK_K, num_stages=4):
+    for k in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
         offsets_k = k + tl.arange(0, BLOCK_K)
         mask_a = mask_m & (offsets_k[None, :] < K)
         mask_b = mask_n & (offsets_k[:, None] < K)
@@ -272,6 +273,7 @@ def _swizzle_matmul_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    NUM_STAGES: tl.constexpr = 4,
 ):
     """1 program이 C tile 하나를 계산한다."""
     tile_id = tl.program_id(0)
@@ -301,7 +303,7 @@ def _swizzle_matmul_kernel(
 
     # K축을 순회하며 FP32 acc에 tl.dot을 누적한다.
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in tl.range(0, K, BLOCK_K, num_stages=4):
+    for k in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
         offsets_k = k + tl.arange(0, BLOCK_K)
         mask_a = mask_m & (offsets_k[None, :] < K)
         mask_b = mask_n & (offsets_k[:, None] < K)
@@ -949,6 +951,127 @@ def tma_warp_specialized_matmul(
                 "TMA WS practice", a.device, a.dtype, M, N, K, warp_specialize,
                 TMA_BLOCK_M, TMA_BLOCK_N, TMA_BLOCK_K, num_programs,
                 kernel.metadata.num_warps, kernel.metadata.num_stages,
+            ),
+        )
+    return c
+
+
+# Epilogue subtiling 실습: 계산한 C tile을 N 방향으로 둘로 나눠 저장한다.
+@triton.jit
+def _tma_epilogue_matmul_kernel(
+    a_desc, b_desc, c_desc,
+    M, N, K,
+    NUM_PROGRAMS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+):
+    start_tile = tl.program_id(0)
+    num_n_tiles = tl.cdiv(N, BLOCK_N)
+    num_tiles = tl.cdiv(M, BLOCK_M) * num_n_tiles
+    tile_id_c = start_tile - NUM_PROGRAMS
+
+    for tile_id in tl.range(
+        start_tile, num_tiles, NUM_PROGRAMS,
+        flatten=True, warp_specialize=WARP_SPECIALIZE,
+    ):
+        start_m = (tile_id // num_n_tiles) * BLOCK_M
+        start_n = (tile_id % num_n_tiles) * BLOCK_N
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for start_k in range(0, K, BLOCK_K):
+            a_tile = a_desc.load([start_m, start_k])
+            b_tile = b_desc.load([start_k, start_n])
+            acc = tl.dot(a_tile, b_tile, acc)
+
+        tile_id_c += NUM_PROGRAMS
+        store_m = (tile_id_c // num_n_tiles) * BLOCK_M
+        store_n = (tile_id_c % num_n_tiles) * BLOCK_N
+        if EPILOGUE_SUBTILE:
+            # EPI 2: acc를 N 방향의 왼쪽/오른쪽 절반으로 나눈다.
+            # reshape: [BM, BN] -> [BM, 2, BN//2]
+            # permute: [BM, 2, BN//2] -> [BM, BN//2, 2]
+            # split: 마지막 크기 2인 축을 분리해 [BM, BN//2] 두 개를 얻는다.
+            # 바로 [BM, BN//2, 2]로 reshape하면 짝수/홀수 열이 섞이니 주의한다.
+            acc_left, acc_right = acc.reshape(BLOCK_M, 2, BLOCK_N // 2).permute(0, 2, 1).split()
+            # EPI 3: 두 조각을 FP16으로 바꿔 c_desc.store로 저장한다.
+            # 왼쪽 시작: [store_m, store_n]
+            # 오른쪽 시작: [store_m, store_n + BLOCK_N//2]
+            # GEMM tile 간격은 여전히 BLOCK_N이다. store의 폭만 절반이다.
+            c_desc.store([store_m, store_n], acc_left.to(tl.float16))
+            c_desc.store([store_m, store_n + BLOCK_N // 2], acc_right.to(tl.float16))
+        else:
+            c_desc.store([store_m, store_n], acc.to(tl.float16))
+
+
+def tma_epilogue_matmul(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    *,
+    epilogue_subtile: bool = True,
+    warp_specialize: bool = False,
+    block_m: int = 128,
+    block_n: int = 128,
+    block_k: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 2,
+    programs_per_sm: int = 1,
+    print_metadata: bool = True,
+) -> torch.Tensor:
+    """동일한 TMA persistent 커널의 전체 타일 저장과 분할 저장을 비교한다."""
+
+    assert a.is_cuda and b.is_cuda and a.device == b.device
+    assert torch.version.cuda is not None, "NVIDIA CUDA 환경이 필요합니다."
+    major, _ = torch.cuda.get_device_capability(a.device)
+    assert major >= 9, "TMA 지원 GPU가 필요합니다."
+    if warp_specialize:
+        assert major >= 10, "이 자동 WS 실습은 Blackwell GPU에서 진행하세요."
+    assert a.ndim == b.ndim == 2 and a.dtype == b.dtype == torch.float16
+    assert a.is_contiguous() and b.is_contiguous()
+    M, K = a.shape
+    K_b, N = b.shape
+    assert K == K_b and min(M, N, K) > 0
+    assert K % 8 == 0 and N % 8 == 0, "K/N은 8의 배수로 사용합니다."
+    assert a.data_ptr() % 16 == 0 and b.data_ptr() % 16 == 0
+    assert all(v >= 16 and v & (v - 1) == 0 for v in (block_m, block_n, block_k))
+    assert num_warps in (4, 8) and num_stages >= 1 and programs_per_sm >= 1
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+    a_desc = TensorDescriptor(
+        base=a, shape=[M, K], strides=list(a.stride()), block_shape=[block_m, block_k],
+    )
+    b_desc = TensorDescriptor(
+        base=b, shape=[K, N], strides=list(b.stride()), block_shape=[block_k, block_n],
+    )
+    # EPI 1: True일 때만 c_block_n을 block_n//2로 바꾼다.
+    # c_desc의 전체 shape/strides와 A/B descriptor는 바꾸지 않는다.
+    c_block_n = block_n // 2 if epilogue_subtile else block_n
+    c_desc = TensorDescriptor(
+        base=c, shape=[M, N], strides=list(c.stride()), block_shape=[block_m, c_block_n],
+    )
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    num_sms = torch.cuda.get_device_properties(a.device).multi_processor_count
+    num_programs = min(num_sms * programs_per_sm, num_tiles)
+    kernel = _tma_epilogue_matmul_kernel[(num_programs,)](
+        a_desc, b_desc, c_desc, M, N, K,
+        NUM_PROGRAMS=num_programs,
+        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        WARP_SPECIALIZE=warp_specialize, EPILOGUE_SUBTILE=epilogue_subtile,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    if print_metadata:
+        _print_kernel_metadata_once(
+            "TMA epilogue practice", kernel,
+            (
+                f"BLOCK_M/N/K={block_m}/{block_n}/{block_k}, NUM_PROGRAMS={num_programs}, "
+                f"num_stages={num_stages}, warp_specialize={warp_specialize}, "
+                f"epilogue_subtile={epilogue_subtile}, C store width={c_block_n}"
+            ),
+            (
+                "TMA epilogue practice", a.device, a.dtype, M, N, K,
+                block_m, block_n, block_k, num_warps, num_stages, num_programs,
+                warp_specialize, epilogue_subtile,
             ),
         )
     return c
