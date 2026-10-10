@@ -15,7 +15,7 @@ topic/
 | 주제 | 핵심 내용 | 자료 |
 |---|---|---|
 | Fused Softmax | 1D row mapping, reduction, register/occupancy 측정 | [코드와 측정 기록](./fused_softmax/) |
-| Fused Attention | tiled QKᵀ/PV, online softmax, causal/tail mask | [구현 가이드](./fused_attention/) |
+| Fused Attention | online softmax, causal 분리, persistent, TMA/WS, autotune, backward | [구현 가이드](./fused_attention/) |
 | Persistent Matmul | 기본 tiled GEMM, grouped ordering, persistent scheduling, TMA | [구현 가이드](./persistent_matmul/) |
 | Group GEMM | 여러 shape의 GEMM metadata와 device-side scheduling | [구현 가이드](./group_gemm/) |
 | Block-scaled Matmul | explicit scale fusion, FP8/FP4, `tl.dot_scaled` | [구현 가이드](./block_scaled_matmul/) |
