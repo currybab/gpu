@@ -2,7 +2,8 @@
 
 import torch
 
-from fused_attention import attention
+from attention_fa2 import attention
+from attention_fa1 import attention_fa1
 from attention_variants import (
     attention_autotuned,
     attention_persistent,
@@ -10,17 +11,17 @@ from attention_variants import (
     attention_tma,
     attention_tma_ws,
 )
-from attention_backward import attention_train
 
 
 IMPLEMENTATIONS = {
     "baseline": attention,
+    "fa1": attention_fa1,
+    "fa2": attention,
     "split": attention_split,
     "persistent": attention_persistent,
     "tma": attention_tma,
     "tma-ws": attention_tma_ws,
     "autotune": attention_autotuned,
-    "train": attention_train,
 }
 
 

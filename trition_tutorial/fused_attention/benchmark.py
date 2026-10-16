@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from check import check_attention, check_backward, selected_names
+from check import check_attention, selected_names
 from implementations import IMPLEMENTATIONS, unsupported_reason
 
 
@@ -30,9 +30,6 @@ def main():
             continue
         try:
             check_attention(IMPLEMENTATIONS[name], name)
-            if name == "train":
-                with torch.enable_grad():
-                    check_backward(IMPLEMENTATIONS[name])
         except NotImplementedError as exc:
             print(f"TODO {name}: {exc}")
             continue

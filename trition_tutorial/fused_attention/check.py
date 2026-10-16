@@ -56,33 +56,12 @@ def check_attention(attention_fn, name="baseline"):
             )
 
 
-def check_backward(attention_fn):
-    torch.manual_seed(1)
-    for shape in ((1, 2, 17, 32), (2, 3, 129, 80), (1, 2, 256, 64)):
-        for causal in (False, True):
-            inputs = [torch.randn(shape, device="cuda", dtype=torch.float16,
-                                  requires_grad=True) for _ in range(3)]
-            # 의도적으로 non-contiguous dO를 전달해 wrapper의 contiguous 경로 확인.
-            do = torch.randn((*shape[:-1], shape[-1] * 2), device="cuda",
-                             dtype=torch.float16)[..., ::2]
-            scale = shape[-1] ** -0.5
-            reference = attention_reference(*inputs, causal, scale)
-            expected = torch.autograd.grad(reference, inputs, do)
-            actual_output = attention_fn(*inputs, causal, scale)
-            actual = torch.autograd.grad(actual_output, inputs, do)
-            torch.testing.assert_close(actual_output, reference, atol=1e-2, rtol=0)
-            for label, result, target in zip(("dQ", "dK", "dV"), actual, expected):
-                torch.testing.assert_close(result, target, atol=3e-2, rtol=1e-2)
-                print(f"train {label} passed: shape={shape}, causal={causal}, "
-                      f"max_abs_error={(result - target).abs().max().item():.6f}")
-
-
 def selected_names(args):
     return list(IMPLEMENTATIONS) if "all" in args.impl else list(dict.fromkeys(args.impl))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fused attention 구현별 정확도 검사")
+    parser = argparse.ArgumentParser(description="Fused attention forward 정확도 검사")
     parser.add_argument("--impl", nargs="+", choices=[*IMPLEMENTATIONS, "all"],
                         default=["baseline"])
     args = parser.parse_args()
@@ -94,8 +73,6 @@ def main():
             continue
         try:
             check_attention(IMPLEMENTATIONS[name], name)
-            if name == "train":
-                check_backward(IMPLEMENTATIONS[name])
         except NotImplementedError as exc:
             print(f"TODO {name}: {exc}")
             incomplete += 1

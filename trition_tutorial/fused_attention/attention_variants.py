@@ -1,6 +1,6 @@
 """Forward 확장 실습. 계산 TODO를 채운 뒤 해당 wrapper의 raise를 삭제한다.
 
-기본 stride 버전은 fused_attention.py에 유지한다. 이 파일은 contiguous FP16
+기본 stride 버전은 attention_fa2.py에 유지한다. 이 파일은 contiguous FP16
 self-attention에 집중한다. split/persistent/autotune은 같은 raw kernel을 쓴다.
 """
 
@@ -56,9 +56,9 @@ def _raw_inner(q, K, V, acc, m_i, l_i, start_m, head_offset,
 
 
 @triton.jit
-def _raw_fwd(Q, K, V, O, LSE, N_CTX, N_HEADS_TOTAL, sm_scale,
+def _raw_fwd(Q, K, V, O, N_CTX, N_HEADS_TOTAL, sm_scale,
              HEAD_DIM: tl.constexpr, CAUSAL: tl.constexpr,
-             SAVE_LSE: tl.constexpr, BLOCK_M: tl.constexpr,
+             BLOCK_M: tl.constexpr,
              BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr):
     tl.static_assert(BLOCK_M % BLOCK_N == 0)
     tiles_per_head = tl.cdiv(N_CTX, BLOCK_M)
@@ -88,10 +88,6 @@ def _raw_fwd(Q, K, V, O, LSE, N_CTX, N_HEADS_TOTAL, sm_scale,
                 q, K, V, acc, m_i, l_i, start_m, head_offset, N_CTX, sm_scale,
                 HEAD_DIM, BLOCK_M, BLOCK_N, BLOCK_D, 3)
         # TODO SPLIT 5: O에 acc / l_i를 FP16 store (row/dimension mask).
-        if SAVE_LSE:
-            # TODO LSE: LSE[head * N_CTX + offs_m]에 m_i + log2(l_i) 저장.
-            # LSE는 FP32 [B,H,N], base-2 값이며 row tail만 mask한다.
-            _ = LSE, m_i, l_i
         _ = offs_m, offs_d
 
 
@@ -103,16 +99,15 @@ RAW_CONFIGS = [
 ]
 _autotuned_raw_fwd = triton.autotune(
     configs=RAW_CONFIGS,
-    key=["N_CTX", "N_HEADS_TOTAL", "HEAD_DIM", "CAUSAL", "SAVE_LSE"],
+    key=["N_CTX", "N_HEADS_TOTAL", "HEAD_DIM", "CAUSAL"],
 )(_raw_fwd)
 
 
 def _launch_raw(q, k, v, causal, sm_scale, *, persistent=False,
-                autotune=False, save_lse=False, programs_per_sm=1):
+                autotune=False, programs_per_sm=1):
     batch, heads, n, d = validate_inputs(q, k, v)
     assert programs_per_sm > 0
     output = torch.empty_like(q)
-    lse = torch.empty((batch, heads, n), device=q.device, dtype=torch.float32)
     num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
 
     def grid(meta):
@@ -121,10 +116,10 @@ def _launch_raw(q, k, v, causal, sm_scale, *, persistent=False,
 
     kernel = _autotuned_raw_fwd if autotune else _raw_fwd
     config = {} if autotune else dict(BLOCK_M=64, BLOCK_N=64, num_warps=4, num_stages=2)
-    kernel[grid](q, k, v, output, lse, n, batch * heads, sm_scale,
+    kernel[grid](q, k, v, output, n, batch * heads, sm_scale,
                  HEAD_DIM=d, BLOCK_D=triton.next_power_of_2(d),
-                 CAUSAL=causal, SAVE_LSE=save_lse, **config)
-    return (output, lse) if save_lse else output
+                 CAUSAL=causal, **config)
+    return output
 
 
 def attention_split(q, k, v, causal, sm_scale):

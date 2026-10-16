@@ -1,8 +1,8 @@
-# Triton Fused Attention 개념별 구현 가이드
+# Triton FlashAttention forward 구현 가이드
 
-Attention 계산과 GPU 최적화에 필요한 개념을 직접 구현해 보는 실습이다.
-기본 forward에서는 다음 계산을
-`하나의 Triton forward kernel`에 담는다.
+FA1/FA2 forward의 tiling과 online softmax를 Triton 코드로 옮기는 실습이다.
+FA1의 K/V 중심 루프와 FA2의 query tile 중심 루프를 각각 구현하고,
+둘 다 다음 계산을 `하나의 Triton forward kernel`에 담는다.
 
 ```text
 QK^T -> scale / causal mask -> online softmax -> PV -> O
@@ -16,28 +16,135 @@ QK^T -> scale / causal mask -> online softmax -> PV -> O
 online softmax, mask와 수치 안정성이다. 그 기반을 이해한 뒤 관심 있는 주제를
 선택한다.
 
-- 학습 연산: LSE를 이용한 probability 재계산과 backward.
+- Attention 계산: QKᵀ/PV, online softmax 상태 갱신, 마지막 한 번의 정규화.
 - 데이터 이동: raw pointer와 TMA descriptor, load/계산 overlap과 warp specialization.
 - 작업 배치와 튜닝: causal 계산 생략, persistent scheduling, tile/warp/stage 선택.
 
-backward를 이해하는 데 TMA나 persistent를 먼저 구현할 필요는 없다.
-이 저장소의 backward 뼈대는 코드 재사용을 위해 raw split forward에 연결되어 있다.
-TMA와 WS는 그와 별개로 선택하는 하드웨어 최적화 실습이다.
+현재 범위는 forward다. 먼저 기본 커널에서 상태가 어떻게 유지되는지 확인하고,
+TMA와 WS 등은 관심에 따라 선택한다. 기본 커널에도 query tile 단위 병렬화가
+있으며, persistent는 그 tile들을 program에 배분하는 방식을 바꾸는 추가 실험이다.
 
 | `--impl` | 학습할 내용 | 구현 위치 | 입력 범위 |
 |---|---|---|---|
-| `baseline` | stride, tail mask, online softmax | `fused_attention.py` | FP16, 임의 stride, N tail, D=16~128 |
+| `baseline` | stride, tail mask, online softmax | `attention_fa2.py` | FP16, 임의 stride, N tail, D=16~128 |
+| `fa1` | K/V 바깥 루프, 정규화된 O와 통계의 반복 저장 | `attention_fa1.py` | contiguous FP16, N/D tail |
+| `fa2` | Q tile별 병렬화, 정규화 전 출력 누적 | `attention_fa2.py` (`baseline`과 동일) | baseline과 동일 |
 | `split` | causal 과거/대각 구간 분리 | `attention_variants.py`: SPLIT | contiguous, N/D tail |
 | `persistent` | 제한된 program이 query tile 여러 개 처리 | 같은 파일: PERSISTENT | split과 동일 |
 | `tma` | host TensorDescriptor load/store | 같은 파일: TMA | Hopper 이상, contiguous, N=128의 배수, D=64/128 |
 | `tma-ws` | K/V loop의 자동 warp specialization | 같은 파일: WS | Blackwell, TMA와 동일 |
 | `autotune` | BLOCK_M/N, warp/stage 탐색 | 같은 파일: RAW_CONFIGS | split과 동일 |
-| `train` | LSE 저장, backward, autograd 연결 | `attention_backward.py`: BWD | contiguous, N/D tail, 1차 gradient |
 
-모든 변형은 같은 self-attention 수식을 계산한다. `split/persistent/autotune/train`은
+모든 변형은 같은 self-attention 수식을 계산한다. `split/persistent/autotune`은
 raw forward 본문을 공유하고, `tma/tma-ws`는 descriptor 본문을 공유한다.
 TMA·persistent·WS는 서로 다른 선택이다. 데이터 이동 방식, program의 작업 배치,
 warp의 역할 분할을 각각 바꾼다. persistent가 항상 빠르다는 가정은 하지 않는다.
+
+## FA1 vs FA2: 둘 다 최적화하며 비교하기
+
+목표는 FA1을 일부러 느리게 작성해서 FA2가 이기는 결과를 만드는 것이 아니라,
+두 알고리즘을 이해하고 각 구조에서 얻을 수 있는 성능을 찾아보는 것이다.
+
+| 비교할 부분 | FA1 방식 | FA2 방식 |
+|---|---|---|
+| program 소유 범위 | head 하나 | query tile 하나 |
+| 내부 루프 | K/V 바깥, Q 안쪽 | K/V 순회 |
+| 출력 상태 | 매 block 정규화, global buffer에 저장 | FP32 acc 유지, 마지막 한 번 정규화 |
+| program 수 | B × H | B × H × ceil(N / BLOCK_M) |
+| 튜닝 변수 | BLOCK_M/N, num_warps, num_stages | 동일한 후보 범위에서 독립 탐색 |
+
+FA1도 전체 forward를 한 번의 kernel launch로 처리한다. K/V block마다 Python에서
+kernel을 호출하면 launch overhead와 알고리즘 차이를 함께 재게 되므로 이 실습에서는
+그렇게 구성하지 않는다. 양쪽 모두 causal의 완전히 미래인 영역은 건너뛰며, 대각 tile에는
+mask를 적용한다. FA1은 현재 key block에서 기여가 전혀 없는 query row의 NaN 처리도 필요하다.
+
+FA1의 정규화된 중간 O는 반복 FP16 반올림을 피하기 위해 **FP32 scratch**에 저장한다.
+마지막 FP16 변환도 같은 kernel 안에서 처리하며 그 비용은 측정에 포함된다. 따라서
+이 뼈대의 실제 메모리 이동량에는 FP32 상태 저장과 마지막 변환 비용이 들어간다.
+
+`prepare_fa1()`과 `prepare_fa2()`는 buffer를 미리 할당한 뒤 재실행할 callable을
+반환한다. 각 파일의 TODO를 채우고 prepare 함수의 raise를 삭제하면 아래를 실행할 수 있다.
+FA2의 launch는 연결되어 있으므로 TODO 8은 argument 대응을 확인하는 실습이다.
+
+```bash
+# 먼저 같은 reference로 결과 확인
+.venv/bin/python trition_tutorial/fused_attention/check.py --impl fa1 fa2
+
+# 같은 tile/warp/stage로 구조 비교
+.venv/bin/python trition_tutorial/fused_attention/compare_fa.py --preset fixed
+
+# 작은 B×H: sequence 방향 병렬화의 영향
+.venv/bin/python trition_tutorial/fused_attention/compare_fa.py \
+  --preset quick --batch 1 --heads 2 --seq-lens 512 2048 4096
+
+# 큰 B×H: FA1도 충분한 head를 갖는 조건
+.venv/bin/python trition_tutorial/fused_attention/compare_fa.py \
+  --preset full --batch 4 --heads 32 --seq-lens 2048 --head-dim 64
+
+# Modal에서도 동일한 비교 가능
+uv run modal run modal_run.py --gpu B200 \
+  --script trition_tutorial/fused_attention/compare_fa.py \
+  --script-args '--preset quick --batch 1 --heads 2 --seq-lens 2048'
+```
+
+`fixed`는 `(BM,BN,warps,stages)=(64,64,4,2)` 하나, `quick`은 6개,
+`full`은 `BM/BN={32,64,128}`, `warps={4,8}`, `stages={1,2,3,4}`의 72개 후보다.
+각 shape·causal 조건·구현별로 최고 설정을 따로 고른다. 모든 후보는 작은 sequence,
+이중 tail과 실제 측정 shape에서 검증하고, 반복 호출로 FA1 상태 초기화도 확인한다.
+정확도 실패·컴파일 실패·자원 초과 후보는 기록하고 제외한다. 예상하지 못한 runtime
+오류는 중단한다. `full` 탐색은 여러 shape를 한꺼번에 넣기보다 관심 shape부터 실행한다.
+
+측정은 사전 할당된 buffer를 CUDA Graph에서 반복 사용하는 GPU 시간이다.
+컴파일·할당 비용은 제외하고, FA1의 커널 내부 상태 초기화·갱신 비용은 포함한다.
+L2 flush 없이 같은 buffer를 재사용하므로 이를 HBM 대역폭 실측으로 해석하지 않는다.
+기존 `benchmark.py`의 wrapper 포함 시간과도 구분한다.
+
+검색 후에는 고정 설정과 각 구현의 최고 설정을 각각 FA1/FA2 순서를 번갈아 재측정한다.
+기본 3회 측정의 중앙값과 원본 값을 저장한다. `FA1 시간 / FA2 시간`이 1보다 크면
+FA2가 그 비율만큼 빠르다. 양쪽 결과가 모두 있을 때만 배율을 표시한다.
+이는 **탐색한 후보 중 최고 성능**이며 모든 가능한 최적화를 끝냈다는 뜻은 아니다.
+
+결과는 `tuning_results/fa_compare_<UTC시각>.csv/.json`에 저장한다.
+Modal은 `OUT_DIR`를 통해 결과를 회수한다. CSV에는 실패 이유와 register/spill/shared
+memory 정보가 포함되고, JSON에는 GPU·Torch·Triton 버전, 소스 hash, 고정/최고 설정
+비교가 들어간다. 미구현이면 TODO만 출력하고 성능 파일은 생성하지 않는다.
+
+그다음에는 causal 구간 분리, TMA, WS를 붙이며 각각의 효과를 분리해서 측정한다.
+FA1의 루프를 Q 중심으로 바꾼 뒤 여전히 FA1이라고 이름 붙이면 구조 비교가 흐려지므로,
+알고리즘의 구분을 유지하는 튜닝과 새 구조의 실험을 구별한다.
+공식 CUDA 구현의 split-K/split-Q warp 배치를 이 Triton 뼈대가 그대로 재현하지는 않는다.
+결과는 이 저장소의 FA1/FA2 **방식** 비교로 기록한다.
+알고리즘 기준: [FA1 논문](https://arxiv.org/abs/2205.14135),
+[FA2 논문](https://tridao.me/publications/flash2/flash2.pdf).
+
+## FA2 forward 수식을 코드에 연결하기
+
+`attention_fa2.py`가 출발점이다. 글에서 바깥 Q loop로 표현한 작업을 이 커널은
+`tl.program_id(0)`으로 나눠 실행한다. 각 program은 query tile 하나를 맡고,
+내부의 `start_n` loop가 K/V tile들을 순회한다.
+
+| 글의 기호/개념 | 코드 | 확인할 점 |
+|---|---|---|
+| Q 행 블록 `i` | `query_block`, `offs_m` | program마다 다른 query row |
+| K/V 열 블록 `j` | `start_n`, `offs_n` | 같은 Q tile로 모든 유효 K/V 처리 |
+| `B_r`, `B_c`, `d` | `BLOCK_M`, `BLOCK_N`, `HEAD_DIM` | `BLOCK_D`는 dot을 위한 D padding |
+| 행별 최댓값 `m_i` | `m_i` | 새 최대에 맞춰 누적 상태 rescale |
+| 행별 분모 `ℓ_i` | `l_i` | FP32 누적 |
+| 정규화 전 출력 `Õ_i` | `acc` | K/V loop 안에서 나누지 않음 |
+| 최종 출력 `O_i` | `acc / l_i[:, None]` | loop 뒤에 한 번 정규화·store |
+
+글의 자연 지수 `exp` 대신 이 뼈대는 `exp2`를 쓴다. 따라서 score에
+`sm_scale * log2(e)`를 곱한다. 이때 `m_i`는 변환된 score의 최댓값이며,
+`alpha = exp2(m_old - m_new)`로 이전 `l_i`와 `acc`를 함께 보정한다.
+`p = exp2(qk - m_new)`는 아직 행 합이 1인 probability가 아니다.
+이 `p`로 바로 PV를 누적하고 마지막에만 `l_i`로 나누는 부분이 핵심이다.
+
+글에서 SRAM으로 묶어 설명한 상태는 실제 코드에서 register/shared memory와
+compiler layout으로 구체화된다. `acc`는 Triton의 논리적인 FP32 tile이고,
+성능 실험에서는 register 사용량과 spill도 확인한다.
+
+현재 forward 출력은 O뿐이므로 LSE 저장은 필요 없다. 우선 TODO를 채워 causal과
+non-causal, tail case를 통과시키면 글의 수식이 실제 GPU 계산으로 연결된다.
 
 ## 어디서 시작할까
 
@@ -51,16 +158,17 @@ Fused Attention에 필요한 직접적인 선수 지식은 tiled matmul의 point
 
 ```text
 fused_attention/
-├── fused_attention.py     # stride 기반 forward 뼈대
+├── attention_fa1.py       # K/V 중심 forward 뼈대, prepare_fa1
+├── attention_fa2.py     # Q tile 중심 forward 뼈대, prepare_fa2
 ├── attention_variants.py  # forward 최적화 실습과 launch
-├── attention_backward.py  # preprocess/dQ/dK+dV와 autograd 뼈대
 ├── implementations.py     # --impl 이름, 하드웨어 조건
-├── check.py               # FP32 reference, forward/gradient 검사
+├── check.py               # FP32 reference와 forward 검사
 ├── benchmark.py           # 검증한 forward와 Torch SDPA 비교
+├── compare_fa.py          # FA1/FA2 사전 할당 비교, 개별 튜닝, CSV/JSON
 └── README.md              # 구현 가이드
 ```
 
-`fused_attention.py`의 공개 함수는 다음 시그니처를 유지한다.
+`attention_fa2.py`의 공개 함수는 다음 시그니처를 유지한다.
 
 ```python
 def attention(q, k, v, causal: bool, sm_scale: float):
@@ -75,9 +183,9 @@ def attention(q, k, v, causal: bool, sm_scale: float):
 
 ```bash
 # 로컬: 구현한 단계만 선택 (기본값은 baseline)
+.venv/bin/python trition_tutorial/fused_attention/check.py --impl baseline
 .venv/bin/python trition_tutorial/fused_attention/check.py --impl split persistent
 .venv/bin/python trition_tutorial/fused_attention/check.py --impl tma tma-ws
-.venv/bin/python trition_tutorial/fused_attention/check.py --impl train
 .venv/bin/python trition_tutorial/fused_attention/benchmark.py --impl split tma
 
 # 전체 진행 상황: TODO 또는 전부 SKIP이면 종료 코드 1
@@ -161,8 +269,7 @@ uv run modal run modal_run.py \
 | `[4, 16, 257, 64]` | 많은 query tile과 persistent scheduling |
 
 확장 raw 단계는 위 shape를 contiguous로 검사한다. TMA 단계는 별도의 full-tile
-case를 사용한다. `train`은 forward 외에 `dQ/dK/dV`도 검사하며 gradient 허용 오차는
-`atol=3e-2, rtol=1e-2`다. reference는 Q/K/V를 FP32로 올려 계산한다.
+case를 사용한다. reference는 Q/K/V를 FP32로 올려 계산한다.
 
 처음에는 첫 case만 남기고, 구현 순서에 맞춰 뒤 case를 다시 활성화해도 된다.
 
@@ -217,7 +324,7 @@ exp(x) = 2^(x * log2(e))
 qk_scale = sm_scale * 1.4426950408889634
 ```
 
-첫 forward 구현은 backward용 log-sum-exp를 저장할 필요가 없다. 나중에 backward를 추가할 때 `M = m_i + log2(l_i)`를 별도 buffer에 저장한다.
+forward만 계산하므로 마지막에는 O를 저장하면 된다.
 
 ## program과 tile 배치
 
@@ -322,7 +429,7 @@ K/V tail은 load mask로 0을 채우되, 해당 key의 score는 반드시 `-inf`
 
 ## forward kernel 뼈대
 
-`fused_attention.py`에는 program mapping, online-softmax 상태, K/V loop, wrapper 설정까지 들어 있다. 긴 완성 kernel을 README와 코드에 중복하지 않고 다음 TODO 경계만 제공한다.
+`attention_fa2.py`에는 program mapping, online-softmax 상태, K/V loop, wrapper 설정까지 들어 있다. 긴 완성 kernel을 README와 코드에 중복하지 않고 다음 TODO 경계만 제공한다.
 
 | TODO | 구현 내용 |
 |---:|---|
@@ -333,7 +440,7 @@ K/V tail은 load mask로 0을 채우되, 해당 key의 score는 반드시 `-inf`
 | 5 | `m_i/l_i/acc` online-softmax 갱신 |
 | 6 | V tile load와 `P @ V` 누적 |
 | 7 | normalize 후 O store |
-| 8 | Python wrapper에서 kernel launch |
+| 8 | 준비된 Python launch의 stride/meta-parameter 대응 확인 |
 
 구현할 때 지킬 점:
 
@@ -440,7 +547,6 @@ uv run modal run modal_run.py \
 ```
 
 `benchmark.py`는 먼저 `check_attention()`을 실행하고 실제 측정 shape도 검증한다.
-`train`은 backward correctness까지 검사하되 시간은 forward만 측정한다.
 그다음 causal/non-causal에서 다음을 측정한다.
 
 - `torch.nn.functional.scaled_dot_product_attention`
@@ -507,33 +613,6 @@ wrapper의 raise를 삭제하고 `--impl autotune`을 실행한다. 잘못된 �
 이 단계는 raw kernel을 튜닝한다. TMA autotune으로 확장하려면 후보마다 descriptor의
 `block_shape`도 갱신하는 config pre-hook이 추가로 필요하다. block meta만 바꾸고
 descriptor shape를 고정해 두면 load/store tile shape가 어긋난다.
-
-## 학습을 위한 gradient 계산: backward
-
-먼저 raw forward의 `SAVE_LSE` 분기를 완성한다. 저장할 값은 FP32 `[B,H,N]`의
-`LSE = m_i + log2(l_i)`다. 이후 full probability 행렬을 저장하는 대신 tile마다
-다음 식으로 재계산한다. 여기서 `S = QKᵀ * sm_scale`이다.
-
-```text
-P     = exp2(S * log2(e) - LSE)
-Delta = rowsum(O * dO)
-dP    = dO @ Vᵀ
-dS    = P * (dP - Delta)
-dQ    = (dS @ K) * sm_scale
-dK    = (dSᵀ @ Q) * sm_scale
-dV    = Pᵀ @ dO
-```
-
-`dS`는 자연 지수 softmax의 scaled score에 대한 미분이다. 따라서 gradient 식에
-`log2(e)`를 다시 곱하지 않는다. causal 미래 위치와 tail의 P는 0으로 둔다.
-
-`_bwd_preprocess`는 Delta를 만들고, `_bwd_dq`는 query tile을 소유하며 K/V를
-순회한다. `_bwd_dkdv`는 key tile을 소유하며 query를 순회한다. 후자는 dK/dV를
-atomic 없이 한 번 저장할 수 있지만 P/dS를 재계산하는 비용이 든다.
-
-`_AttentionAutograd`에는 저장할 tensor와 3개 커널 launch가 연결되어 있다.
-기본 `attention()`은 inference 실습이고, gradient를 붙일 때는 `attention_train()`을
-사용한다. backward는 forward와 별도의 launch이며 double backward는 이 실습 범위에 없다.
 
 ## 후속 과제
 
