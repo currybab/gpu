@@ -89,8 +89,10 @@ uv run modal run modal_run.py --gpu B200 \
 
 `fixed`는 `(BM,BN,warps,stages)=(64,64,4,2)` 하나, `quick`은 6개,
 `full`은 `BM/BN={32,64,128}`, `warps={4,8}`, `stages={1,2,3,4}`의 72개 후보다.
-각 shape·causal 조건·구현별로 최고 설정을 따로 고른다. 모든 후보는 작은 sequence,
-이중 tail과 실제 측정 shape에서 검증하고, 반복 호출로 FA1 상태 초기화도 확인한다.
+각 shape·causal 조건·구현별로 최고 설정을 따로 고른다. 모든 후보는 측정 대상 D에서
+작은 sequence, N tail과 실제 측정 shape를 검증하고, 반복 호출로 FA1 상태 초기화도 확인한다.
+D padding은 `--head-dim 80`이나 기본 `check.py`에서 확인한다. D=64 튜닝 후보를
+D=80의 더 큰 BLOCK_D에서 자원이 부족하다는 이유로 제외하지 않는다.
 정확도 실패·컴파일 실패·자원 초과 후보는 기록하고 제외한다. 예상하지 못한 runtime
 오류는 중단한다. `full` 탐색은 여러 shape를 한꺼번에 넣기보다 관심 shape부터 실행한다.
 

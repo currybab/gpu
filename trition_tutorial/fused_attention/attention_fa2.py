@@ -56,13 +56,13 @@ def _attention_fwd(
     # TODO 1: Q[offs_m, offs_d]를 mask와 함께 한 번 load한다.
     q_ptrs = q_ptr + q_head_offset + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
     q_mask = (offs_m[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM)
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0) # [BLOCK_M, BLOCK_D]
 
     # 글의 m_i, ℓ_i, Õ_i에 대응. exp2를 쓰므로 m_i는 base-2 score 기준.
     # 이 상태는 K/V loop 전체에 걸쳐 유지한다.
-    m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32)
-    l_i = tl.zeros((BLOCK_M,), tl.float32)
-    acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+    m_i = tl.full((BLOCK_M,), -float("inf"), tl.float32) # [BLOCK_M]
+    l_i = tl.zeros((BLOCK_M,), tl.float32) # [BLOCK_M]
+    acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32) # [BLOCK_M, BLOCK_D]
     qk_scale = sm_scale * 1.4426950408889634
 
     end_n = N_CTX
@@ -75,10 +75,10 @@ def _attention_fwd(
         # TODO 2: k_ptr/k_head_offset/stride_kn/stride_kd로 K tile을 load한다.
         k_ptrs = k_ptr + k_head_offset + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
         k_mask = (offs_n[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM)
-        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+        k = tl.load(k_ptrs, mask=k_mask, other=0.0) # [BLOCK_N, BLOCK_D]
 
         # TODO 3: qk = tl.dot(q, tl.trans(k)) * qk_scale
-        qk = tl.dot(q, k.T) * qk_scale
+        qk = tl.dot(q, k.T) * qk_scale # [BLOCK_M, BLOCK_N]
 
         # TODO 4: key tail과 CAUSAL mask를 qk에 적용한다.
         score_mask = offs_n[None, :] < N_CTX
@@ -90,19 +90,19 @@ def _attention_fwd(
         # m_new = max(m_i, rowmax(qk)), alpha = exp2(m_i - m_new).
         # p = exp2(qk - m_new), l_i = alpha * l_i + rowsum(p).
         # acc에도 alpha를 곱하고 m_i를 m_new로 갱신한다.
-        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
-        alpha = tl.exp2(m_i - m_new)
-        p = tl.exp2(qk - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = alpha[:, None] * acc
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1)) # [BLOCK_M]
+        alpha = tl.exp2(m_i - m_new) # [BLOCK_M]
+        p = tl.exp2(qk - m_new[:, None]) # [BLOCK_M, BLOCK_N]
+        l_i = l_i * alpha + tl.sum(p, axis=1) # [BLOCK_M]
+        acc = alpha[:, None] * acc # [BLOCK_M, BLOCK_D]
         m_i = m_new
 
         # TODO 6: v_ptr와 V stride로 tile을 load하고 P @ V를 acc에 누적한다.
         # 여기의 P는 정규화 전 p다. acc += p @ v; 나눗셈은 loop 뒤에서만.
         v_ptrs = v_ptr + v_head_offset + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
         v_mask = (offs_n[:, None] < N_CTX) & (offs_d[None, :] < HEAD_DIM)
-        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
-        acc = acc + tl.dot(p.to(v.dtype), v)
+        v = tl.load(v_ptrs, mask=v_mask, other=0.0) # [BLOCK_N, BLOCK_D]
+        acc += tl.dot(p.to(v.dtype), v) # [BLOCK_M, BLOCK_D]
 
     # TODO 7: o_ptr/o_head_offset와 O stride로 acc / l_i를 저장한다.
     o_ptrs = o_ptr + o_head_offset + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od

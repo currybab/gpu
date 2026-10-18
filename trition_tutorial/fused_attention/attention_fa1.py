@@ -30,8 +30,8 @@ def _fa1_fwd(Q, K, V, O, O_STATE, M, L, N_CTX, sm_scale,
         col_mask = (cols[:, None] < N_CTX) & (dims[None, :] < HEAD_DIM)
         k_ptrs = K + col_offsets
         v_ptrs = V + col_offsets
-        k = tl.load(k_ptrs, mask=col_mask, other=0.0)
-        v = tl.load(v_ptrs, mask=col_mask, other=0.0)
+        k = tl.load(k_ptrs, mask=col_mask, other=0.0) # [BLOCK_N, BLOCK_D]
+        v = tl.load(v_ptrs, mask=col_mask, other=0.0) # [BLOCK_N, BLOCK_D]
 
         first_m = 0
         if CAUSAL:
@@ -47,16 +47,16 @@ def _fa1_fwd(Q, K, V, O, O_STATE, M, L, N_CTX, sm_scale,
             row_mask = rows < N_CTX
             tile_mask = row_mask[:, None] & (dims[None, :] < HEAD_DIM)
 
-            q = tl.load(Q + row_offsets, mask=tile_mask, other=0.0)
+            q = tl.load(Q + row_offsets, mask=tile_mask, other=0.0) # [BLOCK_M, BLOCK_D]
 
             if start_n == 0:
-                m_old = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32)
-                l_old = tl.zeros((BLOCK_M,), tl.float32)
-                o_old = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+                m_old = tl.full((BLOCK_M,), -float("inf"), dtype=tl.float32) # [BLOCK_M]
+                l_old = tl.zeros((BLOCK_M,), tl.float32) # [BLOCK_M]
+                o_old = tl.zeros((BLOCK_M, BLOCK_D), tl.float32) # [BLOCK_M, BLOCK_D]
             else:
-                m_old = tl.load(M + stat_offsets, mask=row_mask, other=0.0)
-                l_old = tl.load(L + stat_offsets, mask=row_mask, other=0.0)
-                o_old = tl.load(O_STATE + row_offsets, mask=tile_mask, other=0.0)
+                m_old = tl.load(M + stat_offsets, mask=row_mask, other=0.0) # [BLOCK_M]
+                l_old = tl.load(L + stat_offsets, mask=row_mask, other=0.0) # [BLOCK_M]
+                o_old = tl.load(O_STATE + row_offsets, mask=tile_mask, other=0.0) # [BLOCK_M, BLOCK_D]
 
 
             # TODO FA1 3: S=QK^T*qk_scale에 key tail/causal mask를 적용.
@@ -64,36 +64,36 @@ def _fa1_fwd(Q, K, V, O, O_STATE, M, L, N_CTX, sm_scale,
             # causal 대각 영역에는 현재 block의 key가 전부 무효인 row도 있다.
             # 그 row는 exp 계산용 m_block=0, p_block=0, l_block=0으로 NaN을 방지.
             # 최대값을 합칠 때는 무기여 row의 m_block을 -inf로 취급한다.
-            s = tl.dot(q, k.T) * qk_scale
+            s = tl.dot(q, k.T) * qk_scale # [BLOCK_M, BLOCK_N]
 
             score_mask = cols[None, :] < N_CTX
             if CAUSAL:
                 score_mask = score_mask & (rows[:, None] >= cols[None, :])
             s = tl.where(score_mask, s, float("-inf"))
 
-            m_block = tl.max(s, axis=1)
+            m_block = tl.max(s, axis=1) # [BLOCK_M]
             has_keys = m_block != -float("inf")
 
             # 유효한 key가 없는 행은 exp 계산의 기준만 0으로 바꾼다.
             m_for_exp = tl.where(has_keys, m_block, 0.0)
-            p_block = tl.exp2(s - m_for_exp[:, None])
-            l_block = tl.sum(p_block, axis=1)
+            p_block = tl.exp2(s - m_for_exp[:, None]) # [BLOCK_M, BLOCK_N]
+            l_block = tl.sum(p_block, axis=1) # [BLOCK_M]
 
             # TODO FA1 4: new_m=max(m,m_block), alpha=exp2(m-new_m),
             # beta=exp2(m_block-new_m), new_l=alpha*l+beta*l_block。
             # new_o=(alpha*l*o + beta*(p_block @ v))/new_l[:, None]。
             # p_block은 dot 직전에 FP16으로 변환하고 상태와 누적 계산은 FP32.
             # 기여가 없는 row는 이전 상태를 유지하고 invalid query는 store에서 제외.
-            new_m = tl.maximum(m_old, m_block)
-            alpha = tl.exp2(m_old - new_m)
-            beta = tl.exp2(m_block - new_m)
-            new_l = alpha * l_old + beta * l_block
-            pv = tl.dot(p_block.to(v.dtype), v)
-            numerator = (alpha * l_old)[:, None] * o_old + beta[:, None] * pv
-            new_o = numerator / new_l[:, None]
+            new_m = tl.maximum(m_old, m_block) # [BLOCK_M]
+            alpha = tl.exp2(m_old - new_m) # [BLOCK_M]
+            beta = tl.exp2(m_block - new_m) # [BLOCK_M]
+            new_l = alpha * l_old + beta * l_block # [BLOCK_M]
+            pv = tl.dot(p_block.to(v.dtype), v) # [BLOCK_M, BLOCK_D]
+            numerator = (alpha * l_old)[:, None] * o_old + beta[:, None] * pv # [BLOCK_M, BLOCK_D]
+            new_o = numerator / new_l[:, None] # [BLOCK_M, BLOCK_D]
 
             # 새 블록의 기여가 없으면 이전 출력을 그대로 유지한다.
-            new_o = tl.where(has_keys[:, None], new_o, o_old)
+            new_o = tl.where(has_keys[:, None], new_o, o_old) # [BLOCK_M, BLOCK_D]
 
             # TODO FA1 5: 정규화된 new_o와 new_m/new_l을 global memory에 store.
             # O_STATE는 [B,H,N,D], M/L은 [B,H,N]의 contiguous buffer.
@@ -111,7 +111,7 @@ def _fa1_fwd(Q, K, V, O, O_STATE, M, L, N_CTX, sm_scale,
         # TODO FA1 6: O_STATE를 mask load하고 FP16으로 cast한 뒤 O에 mask store.
         offsets = head_offset + rows[:, None] * HEAD_DIM + dims[None, :]
         mask = (rows[:, None] < N_CTX) & (dims[None, :] < HEAD_DIM)
-        out = tl.load(O_STATE + offsets, mask=mask, other=0.0)
+        out = tl.load(O_STATE + offsets, mask=mask, other=0.0) # [BLOCK_M, BLOCK_D]
         tl.store(O + offsets, out.to(tl.float16), mask=mask)
 
 

@@ -55,8 +55,10 @@ def inputs(shape):
 
 
 def validate_candidate(prepare, config, causal, d):
-    # 모든 후보에서 짧은 sequence와 이중 tail을 검사한다.
-    for shape in ((1, 2, 17, d), (1, 2, 129, 80)):
+    # 측정 대상 D에서 짧은 sequence와 N tail을 검사한다.
+    # D=80을 강제하면 D=64용 후보도 더 큰 BLOCK_D의 자원 초과로 제외될 수 있다.
+    # D padding 검증은 --head-dim 80 또는 기본 check.py에서 별도로 수행한다.
+    for shape in ((1, 2, 17, d), (1, 2, 129, d)):
         q, k, v = inputs(shape)
         scale = shape[-1] ** -0.5
         run = prepare(q, k, v, causal, scale, **asdict(config))
